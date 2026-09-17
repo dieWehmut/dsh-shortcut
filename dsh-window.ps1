@@ -56,6 +56,27 @@ function Write-Step { param([string]$Message) Write-Host "==> $Message" -Foregro
 function Write-Note { param([string]$Message) Write-Host "    $Message" -ForegroundColor DarkGray }
 function Write-Fail { param([string]$Message) Write-Host "ERROR: $Message" -ForegroundColor Red }
 
+<#
+.SYNOPSIS
+  Report a failure where the user can see it.
+.DESCRIPTION
+  A shortcut launch runs with a hidden console, so console text alone leaves a
+  click looking like nothing happened. Show a message box as well; without an
+  interactive desktop the console text is the whole report.
+.PARAMETER Message
+  Failure text shown in the console and the message box.
+#>
+function Show-Failure {
+  param([string]$Message)
+  Write-Fail $Message
+  try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    [void][System.Windows.Forms.MessageBox]::Show($Message, $ShortcutName, 'OK', 'Error')
+  } catch {
+    Write-Note 'no interactive desktop; the console text is the whole report'
+  }
+}
+
 function Get-NodeExe {
   $candidates = @(
     (Join-Path $env:ProgramFiles 'nodejs\node.exe'),
@@ -187,6 +208,55 @@ function New-Shortcuts {
   }
 }
 
+function Initialize-WindowApi {
+  if ('Dsh.Win32' -as [type]) { return }
+  Add-Type -Namespace Dsh -Name Win32 -MemberDefinition @"
+[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+[DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+"@
+}
+
+<#
+.SYNOPSIS
+  Raise the application window and keep it inside the screen work area.
+.DESCRIPTION
+  A Chromium app window can restore at a position remembered from another
+  display, or at a size larger than this display, leaving it off-screen where a
+  click looks like no response. This waits for the window, moves it back into
+  view when any edge falls outside the work area, and raises it.
+.PARAMETER Area
+  Primary screen work area the window must stay inside.
+#>
+function Confirm-WindowVisible {
+  param([System.Drawing.Rectangle]$Area)
+  Initialize-WindowApi
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    Start-Sleep -Milliseconds 700
+    $candidates = @(Get-Process msedge, chrome -ErrorAction SilentlyContinue |
+      Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match 'DeepSeek Harness|DSH' })
+    foreach ($window in $candidates) {
+      $rect = New-Object Dsh.Win32+RECT
+      if (-not [Dsh.Win32]::GetWindowRect($window.MainWindowHandle, [ref]$rect)) { continue }
+      $width = $rect.Right - $rect.Left
+      $height = $rect.Bottom - $rect.Top
+      if ($width -le 0 -or $height -le 0) { continue }
+      $outside = $rect.Left -lt $Area.X -or $rect.Top -lt $Area.Y -or $rect.Right -gt ($Area.X + $Area.Width) -or $rect.Bottom -gt ($Area.Y + $Area.Height)
+      if ($outside) {
+        $width = [Math]::Min($width, [int]($Area.Width * 0.94))
+        $height = [Math]::Min($height, [int]($Area.Height * 0.94))
+        $left = [int]($Area.X + ($Area.Width - $width) / 2)
+        $top = [int]($Area.Y + ($Area.Height - $height) / 2)
+        [void][Dsh.Win32]::MoveWindow($window.MainWindowHandle, $left, $top, $width, $height, $true)
+        Write-Note "moved the window into view at ($left,$top) ${width}x${height}"
+      }
+      [void][Dsh.Win32]::SetForegroundWindow($window.MainWindowHandle)
+      return
+    }
+  }
+}
+
 function Invoke-Uninstall {
   param([string]$InstallDir)
   foreach ($name in @($ShortcutName)) {
@@ -212,78 +282,96 @@ function Invoke-Uninstall {
 
 # ---- main ------------------------------------------------------------------
 
-if ($Uninstall) {
-  Invoke-Uninstall -InstallDir $AppDir
-  exit 0
-}
+function Invoke-Launcher {
+  if ($Uninstall) {
+    Invoke-Uninstall -InstallDir $AppDir
+    return
+  }
 
-$node = Get-NodeExe
-if ($null -eq $node) {
-  Write-Fail 'Node.js was not found. Install Node.js 22.19 or newer from https://nodejs.org/ and run this script again.'
-  exit 1
-}
+  $node = Get-NodeExe
+  if ($null -eq $node) {
+    throw 'Node.js was not found. Install Node.js 22.19 or newer from https://nodejs.org/ and run this script again.'
+  }
 
-$versionText = (& $node --version) -replace '^v', ''
-$versionParts = $versionText -split '\.'
-$major = [int]$versionParts[0]
-$minor = [int]$versionParts[1]
-$supported = ($major -eq 22 -and $minor -ge 19) -or ($major -ge 24)
-if (-not $supported) {
-  Write-Fail "Node $versionText is below the supported range (22.19+, or 24+). Update Node.js and run this script again."
-  exit 1
-}
-Write-Note "node $versionText"
+  $versionText = (& $node --version) -replace '^v', ''
+  $versionParts = $versionText -split '\.'
+  $major = [int]$versionParts[0]
+  $minor = [int]$versionParts[1]
+  $supported = ($major -eq 22 -and $minor -ge 19) -or ($major -ge 24)
+  if (-not $supported) {
+    throw "Node $versionText is below the supported range (22.19+, or 24+). Update Node.js and run this script again."
+  }
+  Write-Note "node $versionText"
 
-$bin = Get-DshBin -InstallDir $AppDir
-if ($null -eq $bin) {
-  Invoke-DshInstall -InstallDir $AppDir
   $bin = Get-DshBin -InstallDir $AppDir
-}
-if ($null -eq $bin) { throw 'The dsh package did not install correctly.' }
+  if ($null -eq $bin) {
+    Invoke-DshInstall -InstallDir $AppDir
+    $bin = Get-DshBin -InstallDir $AppDir
+  }
+  if ($null -eq $bin) { throw 'The dsh package did not install correctly.' }
 
-$scriptPath = $MyInvocation.MyCommand.Path
-$iconPath = Join-Path (Split-Path -Parent $scriptPath) 'assets\dsh.ico'
-New-Shortcuts -ScriptPath $scriptPath -IconPath $iconPath
+  $scriptPath = $PSCommandPath
+  $iconPath = Join-Path (Split-Path -Parent $scriptPath) 'assets\dsh.ico'
+  New-Shortcuts -ScriptPath $scriptPath -IconPath $iconPath
 
-if ([string]::IsNullOrWhiteSpace($Url)) {
-  if (Test-PortServing -Candidate $Port) {
-    Write-Step "Port $Port already serves a harness instance; reusing it"
-    $Url = "http://127.0.0.1:$Port/"
-    if (-not $NoWindow) {
-      Write-Note 'If the window reports "unauthorized", close that server and start again to mint a fresh token.'
-    }
-  } else {
-    $log = Join-Path $AppDir 'server.log'
-    $logErr = Join-Path $AppDir 'server.err.log'
-    Write-Step "Starting dsh web on port $Port"
-    $arguments = @($bin, 'web', '--no-open', '--port', "$Port")
-    $process = Start-Process -FilePath $node -ArgumentList $arguments `
-      -RedirectStandardOutput $log -RedirectStandardError $logErr `
-      -PassThru -WindowStyle Hidden
-    Write-Note "server pid $($process.Id); log $log"
-    $Url = Read-ServerUrl -LogPath $log
-    if ($null -eq $Url) {
-      Write-Fail "the server did not report a URL; see $log and $logErr"
-      exit 1
+  if ([string]::IsNullOrWhiteSpace($Url)) {
+    if (Test-PortServing -Candidate $Port) {
+      Write-Step "Port $Port already serves a harness instance; reusing it"
+      $Url = "http://127.0.0.1:$Port/"
+      if (-not $NoWindow) {
+        Write-Note 'If the window reports "unauthorized", close that server and start again to mint a fresh token.'
+      }
+    } else {
+      $log = Join-Path $AppDir 'server.log'
+      $logErr = Join-Path $AppDir 'server.err.log'
+      Write-Step "Starting dsh web on port $Port"
+      $arguments = @($bin, 'web', '--no-open', '--port', "$Port")
+      $process = Start-Process -FilePath $node -ArgumentList $arguments `
+        -RedirectStandardOutput $log -RedirectStandardError $logErr `
+        -PassThru -WindowStyle Hidden
+      Write-Note "server pid $($process.Id); log $log"
+      $Url = Read-ServerUrl -LogPath $log
+      if ($null -eq $Url) {
+        throw "the server did not report a URL; see $log and $logErr"
+      }
     }
   }
-}
 
-Write-Step "Ready: $Url"
+  Write-Step "Ready: $Url"
 
-if ($NoWindow) { exit 0 }
+  if ($NoWindow) { return }
 
-$browserExe = Get-BrowserExe -Preference $Browser
-if ($null -ne $browserExe) {
-  Write-Note "application window via $(Split-Path -Leaf $browserExe)"
+  $browserExe = Get-BrowserExe -Preference $Browser
+  if ($null -eq $browserExe) {
+    Write-Note 'no Edge or Chrome found; opening the default browser instead'
+    Start-Process $Url | Out-Null
+    return
+  }
+
+  # Size and place from the primary screen work area. A fixed size larger than
+  # the display, or a position remembered from a larger display, opens the window
+  # off-screen where a launch looks like nothing happened.
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+  $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+  $width = [Math]::Min(1360, [int]($area.Width * 0.94))
+  $height = [Math]::Min(900, [int]($area.Height * 0.94))
+  $left = [int]($area.X + ($area.Width - $width) / 2)
+  $top = [int]($area.Y + ($area.Height - $height) / 2)
+  Write-Note "application window via $(Split-Path -Leaf $browserExe): ${width}x${height} at ($left,$top)"
   $profileDir = Join-Path $AppDir 'browser-profile'
   Start-Process -FilePath $browserExe -ArgumentList @(
     "--app=$Url",
-    '--window-size=1360,900',
+    "--window-size=$width,$height",
+    "--window-position=$left,$top",
     '--no-first-run',
     "--user-data-dir=$profileDir"
   ) | Out-Null
-} else {
-  Write-Note 'no Edge or Chrome found; opening the default browser instead'
-  Start-Process $Url | Out-Null
+  Confirm-WindowVisible -Area $area
+}
+
+try {
+  Invoke-Launcher
+} catch {
+  Show-Failure $_.Exception.Message
+  exit 1
 }
