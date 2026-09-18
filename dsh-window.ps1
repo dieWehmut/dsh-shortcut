@@ -21,7 +21,9 @@
 
 .PARAMETER Port
   Loopback port for the Web UI. Default 3080. When that port already serves a
-  harness instance the script reuses it instead of starting a second server.
+  harness instance the script reuses it with the launch token recorded on this
+  machine, so the window opens authenticated instead of landing on the 401
+  page.
 
 .PARAMETER AppDir
   Installation directory. Default %LOCALAPPDATA%\dsh-shortcut.
@@ -268,6 +270,160 @@ function Test-PortServing {
   }
 }
 
+<#
+.SYNOPSIS
+  Process that listens on a loopback port.
+.DESCRIPTION
+  Reuse and restart decisions must name the process that owns the port. The
+  cmdlet is unavailable on older Windows builds, so an unknown owner is
+  reported as null and the caller keeps its conservative path.
+.PARAMETER Candidate
+  Loopback port to inspect.
+#>
+function Get-PortOwnerProcessId {
+  param([int]$Candidate)
+  try {
+    $connection = Get-NetTCPConnection -LocalPort $Candidate -State Listen -ErrorAction Stop | Select-Object -First 1
+    if ($null -eq $connection) { return $null }
+    return [int]$connection.OwningProcess
+  } catch {
+    return $null
+  }
+}
+
+<#
+.SYNOPSIS
+  Check whether one URL authenticates against the harness it points at.
+.DESCRIPTION
+  dsh web answers 401 to every unauthenticated request, even one that carries a
+  stale launch token, and answers a redirect when the token or the signed
+  cookie is valid. Reading the status without following the redirect tells the
+  two apart.
+.PARAMETER Candidate
+  URL to request, usually rebuilt from a recorded launch token.
+#>
+function Test-AuthenticatedUrl {
+  param([string]$Candidate)
+  try {
+    $request = [System.Net.HttpWebRequest]::Create($Candidate)
+    $request.Method = 'GET'
+    $request.AllowAutoRedirect = $false
+    $request.Timeout = 5000
+    $request.Proxy = $null
+    try {
+      $response = $request.GetResponse()
+      try { $status = [int]$response.StatusCode } finally { $response.Close() }
+    } catch [System.Net.WebException] {
+      if ($null -eq $_.Exception.Response) { return $false }
+      $status = [int]$_.Exception.Response.StatusCode
+    }
+    return $status -ge 200 -and $status -lt 400
+  } catch {
+    return $false
+  }
+}
+
+<#
+.SYNOPSIS
+  Recover an authenticated URL for a harness server that is already running.
+.DESCRIPTION
+  The launch token is minted per process and printed once, so it survives only
+  in the files a previous launch wrote: server-<port>.url (with the matching
+  server-<port>.pid proving the process still owns the port) and the server
+  logs. Every candidate is verified against the running server before it is
+  trusted, and a token that no longer authenticates falls through to the next
+  record.
+.PARAMETER Port
+  Loopback port the running server listens on.
+.PARAMETER InstallDir
+  Installation directory that holds the recorded launch records.
+#>
+function Get-AuthenticatedServerUrl {
+  param([int]$Port, [string]$InstallDir)
+  $candidates = New-Object System.Collections.Generic.List[string]
+  $owner = Get-PortOwnerProcessId -Candidate $Port
+  $urlFile = Join-Path $InstallDir "server-$Port.url"
+  $pidFile = Join-Path $InstallDir "server-$Port.pid"
+  if ($null -ne $owner -and (Test-Path -LiteralPath $urlFile) -and (Test-Path -LiteralPath $pidFile)) {
+    $recorded = (Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $recordedPid = $null
+    try { $recordedPid = [int]([string]$recorded).Trim() } catch { $recordedPid = $null }
+    if ($null -ne $recordedPid -and $recordedPid -eq $owner) {
+      $recordedUrl = (Get-Content -LiteralPath $urlFile -Raw -ErrorAction SilentlyContinue)
+      if (-not [string]::IsNullOrWhiteSpace($recordedUrl)) { $candidates.Add($recordedUrl.Trim()) }
+    }
+  }
+  foreach ($logPath in @((Join-Path $InstallDir "server-$Port.log"), (Join-Path $InstallDir 'server.log'))) {
+    if (-not (Test-Path -LiteralPath $logPath)) { continue }
+    $text = Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($text)) { continue }
+    $tokens = [regex]::Matches($text, "http://127\.0\.0\.1:$Port/\?token=([A-Za-z0-9_-]{16,})")
+    for ($index = $tokens.Count - 1; $index -ge 0; $index--) {
+      $candidates.Add("http://127.0.0.1:$Port/?token=$($tokens[$index].Groups[1].Value)")
+    }
+  }
+  foreach ($candidate in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+    if (Test-AuthenticatedUrl -Candidate $candidate) { return $candidate }
+  }
+  return $null
+}
+
+<#
+.SYNOPSIS
+  Stop the harness server this installation started on a loopback port.
+.DESCRIPTION
+  When the recorded launch token no longer authenticates, the only way back to
+  an authenticated window is a fresh server, because the token is minted per
+  process. A process is treated as managed when its id matches the recorded
+  server-pid record, or when it runs the dsh entry point from this installation;
+  anything else is left alone and the caller reports instead.
+.PARAMETER Port
+  Loopback port the server listens on.
+.PARAMETER InstallDir
+  Installation directory that holds the recorded server pid and the dsh package.
+#>
+function Stop-ManagedPortOwner {
+  param([int]$Port, [string]$InstallDir)
+  $owner = Get-PortOwnerProcessId -Candidate $Port
+  if ($null -eq $owner) { return $false }
+  $pidFile = Join-Path $InstallDir "server-$Port.pid"
+  $recorded = (Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+  $recordedPid = $null
+  try { $recordedPid = [int]([string]$recorded).Trim() } catch { $recordedPid = $null }
+  if ($null -eq $recordedPid) {
+    # A server started before the launcher recorded pids can still be identified
+    # by its command line: it runs the dsh entry point from this installation.
+    $entry = Join-Path $InstallDir 'node_modules\@deepseek-ai\dsh\lib\bin.js'
+    $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$owner" -ErrorAction SilentlyContinue
+    if ($null -eq $processInfo -or [string]::IsNullOrWhiteSpace($processInfo.CommandLine) -or -not $processInfo.CommandLine.Contains($entry)) {
+      return $false
+    }
+  } elseif ($recordedPid -ne $owner) {
+    return $false
+  }
+  try {
+    $process = Get-Process -Id $owner -ErrorAction Stop
+  } catch {
+    return $false
+  }
+  Write-Note "stopping the previous server (pid $owner) to mint a fresh launch token"
+  $closed = $false
+  try { $closed = $process.CloseMainWindow() } catch { $closed = $false }
+  if ($closed) { $process.WaitForExit(3000) | Out-Null }
+  try {
+    if (-not $process.HasExited) { Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue }
+  } catch {
+    Write-Note 'the previous server already exited'
+  }
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Test-PortServing -Candidate $Port)) { break }
+    Start-Sleep -Milliseconds 250
+  }
+  return -not (Test-PortServing -Candidate $Port)
+}
+
 function Invoke-DshInstall {
   param([string]$InstallDir)
   $npm = Get-NpmCmd
@@ -453,13 +609,18 @@ function Invoke-Launcher {
   if ([string]::IsNullOrWhiteSpace($Url)) {
     if (Test-PortServing -Candidate $Port) {
       Write-Step "Port $Port already serves a harness instance; reusing it"
-      $Url = "http://127.0.0.1:$Port/"
-      if (-not $NoWindow) {
-        Write-Note 'If the window reports "unauthorized", close that server and start again to mint a fresh token.'
+      $Url = Get-AuthenticatedServerUrl -Port $Port -InstallDir $AppDir
+      if ($null -eq $Url) {
+        if (-not (Stop-ManagedPortOwner -Port $Port -InstallDir $AppDir)) {
+          throw "Port $Port is serving but its launch token could not be recovered. Close that process, choose another -Port, or open its own dsh web URL."
+        }
+      } else {
+        Write-Note 'reused the launch token recorded on this machine'
       }
-    } else {
-      $log = Join-Path $AppDir 'server.log'
-      $logErr = Join-Path $AppDir 'server.err.log'
+    }
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+      $log = Join-Path $AppDir "server-$Port.log"
+      $logErr = Join-Path $AppDir "server-$Port.err.log"
       Write-Step "Starting dsh web on port $Port"
       $arguments = @($bin, 'web', '--no-open', '--port', "$Port")
       $process = Start-Process -FilePath $node -ArgumentList $arguments `
@@ -470,6 +631,8 @@ function Invoke-Launcher {
       if ($null -eq $Url) {
         throw "the server did not report a URL; see $log and $logErr"
       }
+      Set-Content -LiteralPath (Join-Path $AppDir "server-$Port.url") -Value $Url -Encoding ASCII -NoNewline
+      Set-Content -LiteralPath (Join-Path $AppDir "server-$Port.pid") -Value "$($process.Id)" -Encoding ASCII -NoNewline
     }
   }
 
