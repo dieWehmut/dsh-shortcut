@@ -111,7 +111,7 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', 'sk-...', 'User')
 ```
 
-### 固定端口和风向
+### 固定端口和浏览器
 
 修改快捷方式的目标参数即可，例如把 `-Port 8080 -Browser chrome` 追加到参数末尾。
 
