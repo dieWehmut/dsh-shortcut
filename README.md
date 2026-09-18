@@ -25,6 +25,10 @@
 2. 启动 `dsh web`（本地服务）
 3. 用 Edge/Chrome 的**应用模式**（`--app=`）打开独立窗口，并写入开始菜单和桌面快捷方式
 
+同时，如果电脑上还没有满足要求的 Node.js，脚本会**自动下载适配本机架构的
+Node.js 运行时**安装到安装目录（校验官方 SHA256，不需要管理员权限，也不改动系统
+PATH）。
+
 每次启动还会自动和仓库比对启动器与图标，有更新就替换并立即用新版本重启（见「自动同步」）。
 
 原有的 `~/.dsh` 数据（会话、设置、凭据）完全保留，脚本不修改 dsh 安装本身。
@@ -54,16 +58,29 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 
 - Windows 10 或更高
 - PowerShell 5.1 或更高（系统自带）
-- **Node.js 22.19+ 或 24+**（[下载](https://nodejs.org/)）
+- **Node.js 22.19+ 或 24+**，没有也可以：脚本会自动安装（见「自动安装 Node.js」）
 - Edge 或 Chrome（用于应用窗口模式；两者都没有时会退回默认浏览器的普通标签页）
 
 脚本只影响当前用户，不需要管理员权限。
+
+## 自动安装 Node.js
+
+启动时会先找可用的 Node.js（22.19+，或 24+）：
+
+1. 已安装且版本满足要求 → 直接使用
+2. 安装了但版本过旧，或完全没有 → 从 nodejs.org 下载**与本机架构匹配**的 Windows
+   版 Node.js（x64 / arm64 / x86 自动识别），必要时自动改用 npmmirror 镜像
+3. 下载的压缩包与官方 SHA256 校验一致才解压，防止下载损坏或被替换
+
+运行时安装在 `%LOCALAPPDATA%\dsh-shortcut\node\` 下，不写系统目录、不需要管理员权限，
+也不修改系统 PATH。只有下载后的首次启动会多花约 30 MB 的时间，之后直接复用。
 
 ## 使用
 
 ### 快捷方式
 
 双击 **DeepSeek Harness**。已经有一个实例在运行时，脚本会复用该实例而不是再起一个。
+复用时会用本机记录的启动令牌恢复已认证的地址，不会再落到 401 认证页。
 
 ### 命令行
 
@@ -92,6 +109,8 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 | `-Browser` | `edge` | `edge`、`chrome`，或 Chromium 系浏览器的绝对路径 |
 | `-Uninstall` | 关闭 | 删除安装目录和快捷方式（保留 `~/.dsh` 数据） |
 | `-NoSync` | 关闭 | 跳过与仓库的比对，直接用本机副本启动 |
+
+> 注意：`-Uninstall` 会连同自动安装的 Node.js 运行时一起删除（它就在安装目录里）。
 
 ### 卸载
 
@@ -128,10 +147,13 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 ## 常见问题
 
 **窗口显示 unauthorized / 401**
-已有实例的一次性 token 过期了。关掉那个服务进程，重新双击快捷方式即可。
+脚本复用已有实例时会用本机记录的令牌自动恢复认证地址，正常情况下不会再出现。
+如果仍出现，通常是这个服务是别的程序启动的：关掉那个服务进程，重新双击快捷方式即可。
 
-**提示 Node 版本过低**
-脚本要求 22.19+ 或 24+（与 dsh 的 `engines` 范围一致）。升级 Node 后重试。
+**提示 Node 版本过低 / 自动安装 Node 失败**
+脚本要求 22.19+ 或 24+（与 dsh 的 `engines` 范围一致）。自动安装会尝试
+nodejs.org 与 npmmirror 两个来源；都失败时按提示到 [nodejs.org](https://nodejs.org/)
+手动安装后重试。
 
 **首次运行很慢**
 首次要下载约 500 个 npm 包，通常 1–3 分钟（视网络情况可能更久）。之后启动只需几秒。

@@ -6,7 +6,9 @@
 .DESCRIPTION
   Downloads the dsh-window launcher into %LOCALAPPDATA%\dsh-shortcut, creates
   Start Menu and desktop shortcuts, and starts the Web UI in a dedicated
-  browser application window. Requires Node.js 22.19+ or 24+.
+  browser application window. A missing or unsupported Node.js runtime is
+  installed automatically for this machine's architecture; no administrator
+  rights are needed.
 
 .EXAMPLE
   irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | iex

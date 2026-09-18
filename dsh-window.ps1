@@ -10,6 +10,11 @@
   browsers expose the --app= window mode; otherwise the default browser opens a
   normal tab as a fallback.
 
+  A missing or unsupported Node.js runtime is installed for this machine under
+  the installation directory, using the official Windows archive that matches
+  the operating system architecture. The download is verified against the
+  published SHA256 sums and needs no administrator rights.
+
   The official Web build ships install metadata (manifest.webmanifest, display
   fullscreen), so the window can also be installed as a PWA from the browser's
   own menu. This script does not modify the dsh installation.
@@ -213,7 +218,234 @@ function Get-NodeExe {
   return $null
 }
 
+<#
+.SYNOPSIS
+  Interpret a node.exe version banner.
+.DESCRIPTION
+  The supported range matches what dsh boots on: 22.19 or newer in the 22 line,
+  or 24 and newer. Anything unreadable is reported as unusable so the caller
+  installs a known-good runtime instead of guessing.
+.PARAMETER NodeExe
+  Path to the node executable to interrogate.
+#>
+function Get-NodeRuntimeInfo {
+  param([string]$NodeExe)
+  if ([string]::IsNullOrWhiteSpace($NodeExe) -or -not (Test-Path -LiteralPath $NodeExe)) { return $null }
+  try {
+    $versionText = (& $NodeExe --version) -replace '^v', ''
+  } catch {
+    return $null
+  }
+  if ($versionText -notmatch '^(\d+)\.(\d+)\.(\d+)') { return $null }
+  $major = [int]$Matches[1]
+  $minor = [int]$Matches[2]
+  return @{
+    Version = $versionText
+    Major = $major
+    Minor = $minor
+    Supported = (($major -eq 22 -and $minor -ge 19) -or ($major -ge 24))
+  }
+}
+
+<#
+.SYNOPSIS
+  Node.exe previously installed under the application directory.
+.DESCRIPTION
+  A runtime this script installed lives directly under the installation
+  directory, so it needs no PATH entry and survives a PATH that points at an
+  unsupported Node.js. The newest supported copy wins when more than one
+  remains from earlier launches.
+.PARAMETER InstallDir
+  Installation directory that may hold a managed node tree.
+#>
+function Get-ManagedNodeExe {
+  param([string]$InstallDir)
+  $root = Join-Path $InstallDir 'node'
+  if (-not (Test-Path -LiteralPath $root)) { return $null }
+  $supported = @()
+  foreach ($exe in @(Get-ChildItem -LiteralPath $root -Filter 'node.exe' -Recurse -Depth 2 -File -ErrorAction SilentlyContinue)) {
+    $info = Get-NodeRuntimeInfo -NodeExe $exe.FullName
+    if ($null -ne $info -and $info.Supported) {
+      $supported += @{ Path = $exe.FullName; Version = [version]$info.Version }
+    }
+  }
+  if ($supported.Count -eq 0) { return $null }
+  return ($supported | Sort-Object { $_.Version } -Descending | Select-Object -First 1).Path
+}
+
+<#
+.SYNOPSIS
+  Architecture name used in the official Node.js Windows archives.
+.DESCRIPTION
+  The runtime must match the operating system, not the calling process: a
+  32-bit host process on 64-bit Windows still needs the 64-bit build. The
+  environment variable is the fallback for hosts where the runtime API is
+  unavailable.
+#>
+function Get-NodeArchitectureName {
+  $architecture = $null
+  try { $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch { $architecture = $null }
+  switch ($architecture) {
+    'X64' { return 'x64' }
+    'Arm64' { return 'arm64' }
+    'X86' { return 'x86' }
+  }
+  switch ($env:PROCESSOR_ARCHITECTURE) {
+    'AMD64' { return 'x64' }
+    'ARM64' { return 'arm64' }
+    'x86' { return 'x86' }
+  }
+  if ([Environment]::Is64BitOperatingSystem) { return 'x64' }
+  return 'x86'
+}
+
+<#
+.SYNOPSIS
+  Download a file without loading it into memory.
+.DESCRIPTION
+  Node.js archives are about 30 MB, which the small in-memory helper should not
+  carry. The response streams to disk with a request timeout sized for a slow
+  connection.
+.PARAMETER Uri
+  Absolute URL to download.
+.PARAMETER Path
+  Destination file path, overwritten when it exists.
+.PARAMETER TimeoutSeconds
+  Total time the transfer may take. Default 600.
+#>
+function Save-RemoteFile {
+  param([string]$Uri, [string]$Path, [int]$TimeoutSeconds = 600)
+  Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  $client = New-Object System.Net.Http.HttpClient
+  $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+  try {
+    $response = $client.GetAsync($Uri, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    try {
+      if (-not $response.IsSuccessStatusCode) { throw "the download server answered $([int]$response.StatusCode)" }
+      $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+      try {
+        $file = [IO.File]::Create($Path)
+        try { $stream.CopyTo($file) } finally { $file.Dispose() }
+      } finally {
+        $stream.Dispose()
+      }
+    } finally {
+      $response.Dispose()
+    }
+  } finally {
+    $client.Dispose()
+  }
+}
+
+<#
+.SYNOPSIS
+  Install a Node.js runtime matched to this machine.
+.DESCRIPTION
+  Downloads the official Windows archive for the operating system architecture
+  from nodejs.org and falls back to the npmmirror binary mirror when the
+  primary source is unreachable. Each archive is accepted only after its
+  SHA256 matches the published sums file from the same source. The runtime is
+  unpacked under the installation directory, so no administrator rights and no
+  system PATH change are needed.
+.PARAMETER InstallDir
+  Installation directory that receives the node tree.
+  Returns the installed node.exe path, or null when every source failed.
+#>
+function Install-NodeRuntime {
+  param([string]$InstallDir)
+  $arch = Get-NodeArchitectureName
+  $lines = if ($arch -eq 'x86') { @('latest-v22.x') } else { @('latest-v24.x', 'latest-v22.x') }
+  $sources = @(
+    'https://nodejs.org/dist',
+    'https://registry.npmmirror.com/-/binary/node'
+  )
+  foreach ($line in $lines) {
+    foreach ($source in $sources) {
+      $sumsUri = "$source/$line/SHASUMS256.txt"
+      try {
+        $sums = [Text.Encoding]::UTF8.GetString((Get-RemoteBytes -Uri $sumsUri))
+      } catch {
+        Write-Note "node download list unavailable ($source/$line): $($_.Exception.Message)"
+        continue
+      }
+      $match = [regex]::Match($sums, "^([0-9a-fA-F]{64})\s+node-(v[0-9][0-9.]*)-win-$arch\.zip", 'Multiline')
+      if (-not $match.Success) {
+        Write-Note "no $arch archive is listed for $line on $source"
+        continue
+      }
+      $expected = $match.Groups[1].Value.ToUpperInvariant()
+      $version = $match.Groups[2].Value
+      $zipName = "node-$version-win-$arch.zip"
+      $zipPath = Join-Path $env:TEMP "dsh-$zipName"
+      Write-Note "downloading $zipName from $source"
+      try {
+        Save-RemoteFile -Uri "$source/$line/$zipName" -Path $zipPath
+      } catch {
+        Write-Note "download failed: $($_.Exception.Message)"
+        continue
+      }
+      $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+      if ($actual -ne $expected) {
+        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        Write-Note "checksum mismatch for $zipName; discarding the download"
+        continue
+      }
+      $root = Join-Path $InstallDir 'node'
+      New-Item -ItemType Directory -Path $root -Force | Out-Null
+      try {
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $root -Force
+      } finally {
+        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+      }
+      $exe = Join-Path $root "node-$version-win-$arch\node.exe"
+      if (Test-Path -LiteralPath $exe) { return $exe }
+      $found = Get-ChildItem -LiteralPath $root -Filter 'node.exe' -Recurse -Depth 2 -File -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($null -ne $found) { return $found.FullName }
+    }
+  }
+  return $null
+}
+
+<#
+.SYNOPSIS
+  Pick the node.exe this launch should use, installing one when needed.
+.DESCRIPTION
+  An installed Node.js in the supported range is used as-is. Otherwise the
+  managed runtime is preferred, and when neither exists one is installed for
+  this machine. Reports the version alongside the path so the caller can print
+  what actually runs.
+.PARAMETER InstallDir
+  Installation directory that receives a managed runtime and holds earlier ones.
+#>
+function Resolve-SupportedNode {
+  param([string]$InstallDir)
+  foreach ($candidate in @(Get-NodeExe) + @(Get-ManagedNodeExe -InstallDir $InstallDir)) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+    $info = Get-NodeRuntimeInfo -NodeExe $candidate
+    if ($null -ne $info -and $info.Supported) {
+      return @{ Exe = $candidate; Version = $info.Version }
+    }
+  }
+  Write-Step 'Installing Node.js for this machine (once; about 30 MB)'
+  try {
+    $installed = Install-NodeRuntime -InstallDir $InstallDir
+  } catch {
+    Write-Note "automatic Node.js install failed: $($_.Exception.Message)"
+    return $null
+  }
+  if ([string]::IsNullOrWhiteSpace($installed)) { return $null }
+  $info = Get-NodeRuntimeInfo -NodeExe $installed
+  if ($null -eq $info -or -not $info.Supported) { return $null }
+  return @{ Exe = $installed; Version = $info.Version }
+}
+
 function Get-NpmCmd {
+  param([string]$NodeExe)
+  if (-not [string]::IsNullOrWhiteSpace($NodeExe)) {
+    $npm = Join-Path (Split-Path -Parent $NodeExe) 'npm.cmd'
+    if (Test-Path -LiteralPath $npm) { return $npm }
+  }
   $command = Get-Command npm.cmd -ErrorAction SilentlyContinue
   if ($null -ne $command) { return $command.Source }
   $node = Get-NodeExe
@@ -425,10 +657,10 @@ function Stop-ManagedPortOwner {
 }
 
 function Invoke-DshInstall {
-  param([string]$InstallDir)
-  $npm = Get-NpmCmd
+  param([string]$InstallDir, [string]$NodeExe)
+  $npm = Get-NpmCmd -NodeExe $NodeExe
   if ($null -eq $npm) {
-    throw 'npm was not found. Install Node.js 22.19 or newer from https://nodejs.org/ and run this script again.'
+    throw 'npm was not found next to the selected Node.js runtime.'
   }
   New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
   $manifest = Join-Path $InstallDir 'package.json'
@@ -438,6 +670,9 @@ function Invoke-DshInstall {
   Write-Step "Installing $DshPackage (first run; 1-3 minutes)"
   Push-Location $InstallDir
   try {
+    # npm.cmd runs its own node.exe from PATH; put the selected runtime first so
+    # the managed install works on a machine whose PATH has no usable node.
+    $env:PATH = "$(Split-Path -Parent $NodeExe);$env:PATH"
     & $npm install $DshPackage --no-audit --no-fund --loglevel=error
     if ($LASTEXITCODE -ne 0) { throw "npm install exited with code $LASTEXITCODE" }
   } finally {
@@ -581,24 +816,16 @@ function Invoke-Launcher {
     }
   }
 
-  $node = Get-NodeExe
-  if ($null -eq $node) {
-    throw 'Node.js was not found. Install Node.js 22.19 or newer from https://nodejs.org/ and run this script again.'
+  $runtime = Resolve-SupportedNode -InstallDir $AppDir
+  if ($null -eq $runtime) {
+    throw 'No supported Node.js runtime is available and the automatic install failed. Install Node.js 22.19+ or 24+ from https://nodejs.org/ and run this script again.'
   }
-
-  $versionText = (& $node --version) -replace '^v', ''
-  $versionParts = $versionText -split '\.'
-  $major = [int]$versionParts[0]
-  $minor = [int]$versionParts[1]
-  $supported = ($major -eq 22 -and $minor -ge 19) -or ($major -ge 24)
-  if (-not $supported) {
-    throw "Node $versionText is below the supported range (22.19+, or 24+). Update Node.js and run this script again."
-  }
-  Write-Note "node $versionText"
+  $node = $runtime.Exe
+  Write-Note "node $($runtime.Version) ($node)"
 
   $bin = Get-DshBin -InstallDir $AppDir
   if ($null -eq $bin) {
-    Invoke-DshInstall -InstallDir $AppDir
+    Invoke-DshInstall -InstallDir $AppDir -NodeExe $node
     $bin = Get-DshBin -InstallDir $AppDir
   }
   if ($null -eq $bin) { throw 'The dsh package did not install correctly.' }
