@@ -14,6 +14,11 @@
   fullscreen), so the window can also be installed as a PWA from the browser's
   own menu. This script does not modify the dsh installation.
 
+  Each launch compares the installed launcher and icon with the repository and
+  replaces them when they differ, so a published fix reaches this machine
+  without reinstalling. An unavailable network leaves the installed copy in
+  place and the launch continues.
+
 .PARAMETER Port
   Loopback port for the Web UI. Default 3080. When that port already serves a
   harness instance the script reuses it instead of starting a second server.
@@ -35,6 +40,9 @@
 
 .PARAMETER Uninstall
   Remove the installation directory and the Start Menu and desktop shortcuts.
+
+.PARAMETER NoSync
+  Start the installed copy without comparing it with the repository.
 #>
 [CmdletBinding()]
 param(
@@ -43,7 +51,8 @@ param(
   [string]$Url,
   [switch]$NoWindow,
   [string]$Browser = 'edge',
-  [switch]$Uninstall
+  [switch]$Uninstall,
+  [switch]$NoSync
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,6 +60,12 @@ Set-StrictMode -Version Latest
 
 $DshPackage = '@deepseek-ai/dsh'
 $ShortcutName = 'DeepSeek Harness'
+$RepoRaw = 'https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main'
+
+# Bound parameters are not visible inside a function, so keep a script-scope
+# copy for the restart that follows a launcher update.
+$CallerParameters = @{}
+foreach ($key in $PSBoundParameters.Keys) { $CallerParameters[$key] = $PSBoundParameters[$key] }
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Note { param([string]$Message) Write-Host "    $Message" -ForegroundColor DarkGray }
@@ -75,6 +90,111 @@ function Show-Failure {
   } catch {
     Write-Note 'no interactive desktop; the console text is the whole report'
   }
+}
+
+<#
+.SYNOPSIS
+  Read a repository file into memory.
+.DESCRIPTION
+  A launch must not stall on an unavailable network, so the request fails fast
+  and the caller keeps the installed copy.
+.PARAMETER Uri
+  Raw repository URL to read.
+#>
+function Get-RemoteBytes {
+  param([string]$Uri)
+  Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  $client = New-Object System.Net.Http.HttpClient
+  $client.Timeout = [TimeSpan]::FromSeconds(8)
+  try {
+    $response = $client.GetAsync($Uri).GetAwaiter().GetResult()
+    try {
+      if (-not $response.IsSuccessStatusCode) { throw "the repository answered $([int]$response.StatusCode)" }
+      return ,($response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult())
+    } finally {
+      $response.Dispose()
+    }
+  } finally {
+    $client.Dispose()
+  }
+}
+
+function Get-BytesHash {
+  param([byte[]]$Bytes)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return [BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-', '')
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function Get-FileHashText {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return $null }
+  return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+<#
+.SYNOPSIS
+  Replace the installed copy when the repository holds different files.
+.DESCRIPTION
+  The installed launcher and icon are compared with the repository by content,
+  so any published fix reaches this machine on the next launch. A launcher that
+  does not parse is not installed, so a bad push leaves the installed copy
+  working. Without a network the installed copy stays in place and the launch
+  continues.
+.PARAMETER InstallDir
+  Installation directory that holds the launcher, its icon, and the dsh package.
+.PARAMETER ScriptPath
+  Launcher file that the current process runs.
+#>
+function Update-FromRepo {
+  param([string]$InstallDir, [string]$ScriptPath)
+  $targets = @(
+    @{ Name = 'dsh-window.ps1'; Uri = "$RepoRaw/dsh-window.ps1"; Path = (Join-Path $InstallDir 'dsh-window.ps1') },
+    @{ Name = 'dsh.ico'; Uri = "$RepoRaw/assets/dsh.ico"; Path = (Join-Path $InstallDir 'assets\dsh.ico') }
+  )
+  $changed = @()
+  foreach ($target in $targets) {
+    try {
+      $remote = Get-RemoteBytes -Uri $target.Uri
+    } catch {
+      Write-Note "sync skipped ($($_.Exception.Message)); keeping the installed copy"
+      return $false
+    }
+    if ($null -eq $remote -or $remote.Length -eq 0) {
+      Write-Note 'sync skipped (the repository returned an empty file); keeping the installed copy'
+      return $false
+    }
+    if ((Get-BytesHash -Bytes $remote) -eq (Get-FileHashText -Path $target.Path)) { continue }
+    if ($target.Name -like '*.ps1') {
+      $tokens = $null
+      $errors = $null
+      [void][System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::UTF8.GetString($remote).TrimStart([char]0xFEFF), [ref]$tokens, [ref]$errors)
+      if (@($errors).Count -gt 0) {
+        Write-Note "sync skipped (the repository $($target.Name) does not parse); keeping the installed copy"
+        return $false
+      }
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $target.Path) -Force | Out-Null
+    $staged = "$($target.Path).new"
+    [IO.File]::WriteAllBytes($staged, $remote)
+    Move-Item -LiteralPath $staged -Destination $target.Path -Force
+    Write-Note "updated $($target.Name)"
+    $changed += $target.Path
+  }
+  if ($changed.Count -eq 0) {
+    Write-Note 'launcher is current'
+    return $false
+  }
+  $running = (Resolve-Path -LiteralPath $ScriptPath -ErrorAction SilentlyContinue).Path
+  foreach ($path in $changed) {
+    $installed = (Resolve-Path -LiteralPath $path -ErrorAction SilentlyContinue).Path
+    if ($null -ne $running -and $null -ne $installed -and $installed -eq $running) { return $true }
+  }
+  return $false
 }
 
 function Get-NodeExe {
@@ -288,6 +408,23 @@ function Invoke-Launcher {
     return
   }
 
+  $scriptPath = $PSCommandPath
+  if (-not $NoSync) {
+    if (Update-FromRepo -InstallDir $AppDir -ScriptPath $scriptPath) {
+      Write-Step 'The launcher was updated from the repository; restarting'
+      # No -WindowStyle: the child inherits this console, so a shortcut launch stays hidden and a terminal launch keeps printing.
+      $forward = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
+      foreach ($key in $CallerParameters.Keys) {
+        if ($key -eq 'NoSync') { continue }
+        $value = $CallerParameters[$key]
+        if ($value -is [switch]) { if ($value.IsPresent) { $forward += "-$key" } }
+        else { $forward += @("-$key", [string]$value) }
+      }
+      & powershell.exe @forward
+      exit $LASTEXITCODE
+    }
+  }
+
   $node = Get-NodeExe
   if ($null -eq $node) {
     throw 'Node.js was not found. Install Node.js 22.19 or newer from https://nodejs.org/ and run this script again.'
@@ -310,7 +447,6 @@ function Invoke-Launcher {
   }
   if ($null -eq $bin) { throw 'The dsh package did not install correctly.' }
 
-  $scriptPath = $PSCommandPath
   $iconPath = Join-Path (Split-Path -Parent $scriptPath) 'assets\dsh.ico'
   New-Shortcuts -ScriptPath $scriptPath -IconPath $iconPath
 
