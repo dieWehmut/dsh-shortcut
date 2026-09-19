@@ -15,6 +15,7 @@
 # Usage:
 #   dsh-window.sh [--port N] [--app-dir DIR] [--browser chrome|edge|brave|PATH]
 #                 [--url URL] [--no-window] [--no-sync] [--uninstall]
+#                 [--self-test]
 #
 # Requires macOS and the tools macOS ships with (curl, shasum, osascript).
 
@@ -31,6 +32,7 @@ BROWSER='chrome'
 NO_WINDOW=0
 NO_SYNC=0
 UNINSTALL=0
+SELF_TEST=0
 
 # Keep the invocation for the restart that follows a launcher update.
 ORIGINAL_ARGS=("$@")
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
     --no-window) NO_WINDOW=1; shift ;;
     --no-sync) NO_SYNC=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
+    --self-test) SELF_TEST=1; shift ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -81,6 +84,19 @@ fetch_text() {
   curl -fsSL --connect-timeout 8 --max-time 20 "$1"
 }
 
+# Download a file without loading it into memory; Node.js archives are ~40 MB.
+fetch_file() {
+  curl -fL --connect-timeout 15 --max-time 600 -o "$2" "$1"
+}
+
+node_arch() {
+  case "$(uname -m)" in
+    arm64) printf 'arm64' ;;
+    x86_64) printf 'x64' ;;
+    *) printf 'x64' ;;
+  esac
+}
+
 # Locations Node.js is commonly installed to on macOS, then PATH.
 find_node_exe() {
   local candidate on_path
@@ -89,6 +105,85 @@ find_node_exe() {
   done
   on_path="$(command -v node 2>/dev/null || true)"
   [ -n "$on_path" ] && { printf '%s' "$on_path"; return 0; }
+  return 1
+}
+
+# A portable runtime this launcher installed lives under the application
+# directory, so it needs no PATH entry.
+find_managed_node_exe() {
+  local install_dir="$1" root candidate
+  root="${install_dir}/node"
+  [ -d "$root" ] || return 1
+  for candidate in $(find "$root" -maxdepth 3 -name node -type f 2>/dev/null || true); do
+    if [ -n "$(node_version_supported "$candidate" || true)" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Install a Node.js runtime matched to this machine.
+#
+# The official .pkg opens the standard installer so the destination can be
+# chosen; when that is skipped or fails, the archive for this CPU ships as a
+# portable runtime under the application directory. Every download is accepted
+# only after its SHA256 matches the published sums from the same source.
+install_node_runtime() {
+  local install_dir="$1" arch line source sums pkg_line expected version found tarball pkg
+  arch="$(node_arch)"
+  found=''
+
+  for line in latest-v24.x latest-v22.x; do
+    for source in https://nodejs.org/dist https://registry.npmmirror.com/-/binary/node; do
+      sums="$(fetch_text "${source}/${line}/SHASUMS256.txt" 2>/dev/null || true)"
+      [ -n "$sums" ] || continue
+      # Prefer the interactive installer: it lets the destination be chosen.
+      pkg_line="$(printf '%s' "$sums" | grep -E "node-v[0-9.]+\.pkg$" | head -n 1 || true)"
+      if [ -n "$pkg_line" ]; then
+        expected="$(printf '%s' "$pkg_line" | awk '{print $1}')"
+        version="$(printf '%s' "$pkg_line" | awk '{print $2}' | sed -e 's/^node-//' -e 's/\.pkg$//')"
+        if [ "${DESKTOP:-1}" = "1" ] && command -v installer >/dev/null 2>&1; then
+          pkg="${install_dir}/node-${version}.pkg"
+          note "downloading node-${version}.pkg from ${source}"
+          if fetch_file "${source}/${line}/node-${version}.pkg" "$pkg" 2>/dev/null; then
+            if [ "$(sha256_of_file "$pkg")" = "$expected" ]; then
+              step 'Opening the Node.js installer (choose the destination there)'
+              if osascript -e "do shell script \"installer -pkg '${pkg}' -target /\" with administrator privileges" >/dev/null 2>&1; then
+                rm -f "$pkg"
+                found="$(find_node_exe || true)"
+                [ -n "$found" ] && { printf '%s' "$found"; return 0; }
+              else
+                note 'the Node.js installer was cancelled; using the portable runtime instead'
+                rm -f "$pkg"
+              fi
+            else
+              rm -f "$pkg"
+              note 'checksum mismatch for the Node.js installer; discarding it'
+            fi
+          fi
+        fi
+      fi
+      # Portable runtime for this CPU.
+      pkg_line="$(printf '%s' "$sums" | grep -E "node-v[0-9.]+-darwin-${arch}\.tar\.gz$" | head -n 1 || true)"
+      [ -n "$pkg_line" ] || continue
+      expected="$(printf '%s' "$pkg_line" | awk '{print $1}')"
+      version="$(printf '%s' "$pkg_line" | awk '{print $2}' | sed -e 's/^node-//' -e "s/-darwin-${arch}\.tar\.gz$//")"
+      tarball="${install_dir}/node-${version}-darwin-${arch}.tar.gz"
+      note "downloading node-${version}-darwin-${arch}.tar.gz from ${source}"
+      fetch_file "${source}/${line}/node-${version}-darwin-${arch}.tar.gz" "$tarball" 2>/dev/null || continue
+      if [ "$(sha256_of_file "$tarball")" != "$expected" ]; then
+        rm -f "$tarball"
+        note 'checksum mismatch for the Node.js archive; discarding it'
+        continue
+      fi
+      mkdir -p "${install_dir}/node"
+      tar -xzf "$tarball" -C "${install_dir}/node"
+      rm -f "$tarball"
+      found="$(find_managed_node_exe "$install_dir" || true)"
+      [ -n "$found" ] && { printf '%s' "$found"; return 0; }
+    done
+  done
   return 1
 }
 
@@ -400,7 +495,16 @@ main() {
   version=""
   [ -n "$node_exe" ] && version="$(node_version_supported "$node_exe" || true)"
   if [ -z "$version" ]; then
-    die 'No supported Node.js runtime (22.19+ or 24+) was found. Install Node.js from https://nodejs.org/ and run this script again.'
+    node_exe="$(find_managed_node_exe "$APP_DIR" || true)"
+    [ -n "$node_exe" ] && version="$(node_version_supported "$node_exe" || true)"
+  fi
+  if [ -z "$version" ]; then
+    step 'Installing Node.js for this machine (once; about 40 MB)'
+    node_exe="$(install_node_runtime "$APP_DIR" || true)"
+    [ -n "$node_exe" ] && version="$(node_version_supported "$node_exe" || true)"
+  fi
+  if [ -z "$version" ]; then
+    die 'No supported Node.js runtime is available and the automatic install failed. Install Node.js 22.19+ or 24+ from https://nodejs.org/ and run this script again.'
   fi
   note "node ${version} (${node_exe})"
 
