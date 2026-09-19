@@ -1,5 +1,6 @@
-*.ps1 text eol=lf
-*.md text eol=lf
-*.ico binary
-*.png binary
+# Shell scripts must keep LF endings; CRLF breaks the shebang on macOS.
+*.sh text eol=lf
 
+*.png binary
+*.ico binary
+*.icns binary
