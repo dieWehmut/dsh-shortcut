@@ -67,13 +67,14 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 
 启动时会先找可用的 Node.js（22.19+，或 24+）：
 
-1. 已安装且版本满足要求 → 直接使用
-2. 安装了但版本过旧，或完全没有 → 从 nodejs.org 下载**与本机架构匹配**的 Windows
-   版 Node.js（x64 / arm64 / x86 自动识别），必要时自动改用 npmmirror 镜像
-3. 下载的压缩包与官方 SHA256 校验一致才解压，防止下载损坏或被替换
+1. 已安装且版本满足要求 → 直接使用（包括安装到自定义目录的，按注册表记录定位）
+2. 安装了但版本过旧，或完全没有 → 弹出 **Node.js 官方安装向导**，可以自己选择安装位置
+   和选项；下载后的安装包与官方 SHA256 校验一致才运行（x64 / arm64 / x86 自动识别，
+   nodejs.org 不通时自动改用 npmmirror 镜像）
+3. 向导被取消、UAC 被拒绝，或没有可交互桌面（无人值守）时 → 自动回退为原来的免管理员
+   便携安装：解压到 `%LOCALAPPDATA%\dsh-shortcut\node\`，不写系统目录、不改系统 PATH
 
-运行时安装在 `%LOCALAPPDATA%\dsh-shortcut\node\` 下，不写系统目录、不需要管理员权限，
-也不修改系统 PATH。只有下载后的首次启动会多花约 30 MB 的时间，之后直接复用。
+想跳过向导直接静默安装：加 `-SilentNodeInstall`。
 
 ## 使用
 
@@ -109,8 +110,10 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 | `-Browser` | `edge` | `edge`、`chrome`，或 Chromium 系浏览器的绝对路径 |
 | `-Uninstall` | 关闭 | 删除安装目录和快捷方式（保留 `~/.dsh` 数据） |
 | `-NoSync` | 关闭 | 跳过与仓库的比对，直接用本机副本启动 |
+| `-SilentNodeInstall` | 关闭 | 不弹 Node.js 安装向导，直接静默安装便携运行时（适合无人值守） |
 
-> 注意：`-Uninstall` 会连同自动安装的 Node.js 运行时一起删除（它就在安装目录里）。
+> 注意：便携运行时会随 `-Uninstall` 一起删除（它就在安装目录里）；用官方安装向导装的
+> Node.js 是系统级安装，卸载脚本不会动它，需要的话请从「应用和功能」里卸载。
 
 ### 卸载
 
@@ -151,9 +154,14 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 如果仍出现，通常是这个服务是别的程序启动的：关掉那个服务进程，重新双击快捷方式即可。
 
 **提示 Node 版本过低 / 自动安装 Node 失败**
-脚本要求 22.19+ 或 24+（与 dsh 的 `engines` 范围一致）。自动安装会尝试
-nodejs.org 与 npmmirror 两个来源；都失败时按提示到 [nodejs.org](https://nodejs.org/)
-手动安装后重试。
+脚本要求 22.19+ 或 24+（与 dsh 的 `engines` 范围一致）。会自动弹出 Node.js 官方安装
+向导；向导里取消或拒绝 UAC 时会自动改用便携安装，两个下载源（nodejs.org 与 npmmirror）
+都失败时按提示到 [nodejs.org](https://nodejs.org/) 手动安装后重试。
+
+**安装向导弹出来后没反应 / 想装到别的盘**
+向导就是 Node.js 官方安装程序，按自己的需要选择安装位置即可，装完脚本会自动找到它
+（按安装包写入注册表的路径定位，不依赖 PATH）。如果向导没弹出来，可能是这台机器不允许
+弹窗（无人值守会话）：脚本会自动转为便携安装。
 
 **首次运行很慢**
 首次要下载约 500 个 npm 包，通常 1–3 分钟（视网络情况可能更久）。之后启动只需几秒。

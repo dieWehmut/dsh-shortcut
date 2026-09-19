@@ -6,9 +6,10 @@
 .DESCRIPTION
   Downloads the dsh-window launcher into %LOCALAPPDATA%\dsh-shortcut, creates
   Start Menu and desktop shortcuts, and starts the Web UI in a dedicated
-  browser application window. A missing or unsupported Node.js runtime is
-  installed automatically for this machine's architecture; no administrator
-  rights are needed.
+  browser application window. When Node.js is missing or unsupported, the
+  official setup wizard opens so the install folder can be chosen; cancelling
+  it or running without a desktop falls back to a portable runtime under the
+  installation directory, which needs no administrator rights.
 
 .EXAMPLE
   irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | iex

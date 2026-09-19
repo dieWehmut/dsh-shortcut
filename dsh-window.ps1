@@ -10,10 +10,12 @@
   browsers expose the --app= window mode; otherwise the default browser opens a
   normal tab as a fallback.
 
-  A missing or unsupported Node.js runtime is installed for this machine under
-  the installation directory, using the official Windows archive that matches
-  the operating system architecture. The download is verified against the
-  published SHA256 sums and needs no administrator rights.
+  A missing or unsupported Node.js runtime is installed for this machine. The
+  official Node.js setup opens first, so the install folder and options can be
+  chosen by hand; a download the launcher verified against the published
+  SHA256 sums. When the setup is cancelled, declined by elevation, or there is
+  no interactive desktop, the launcher falls back to a portable runtime under
+  the installation directory that needs no administrator rights.
 
   The official Web build ships install metadata (manifest.webmanifest, display
   fullscreen), so the window can also be installed as a PWA from the browser's
@@ -50,6 +52,10 @@
 
 .PARAMETER NoSync
   Start the installed copy without comparing it with the repository.
+
+.PARAMETER SilentNodeInstall
+  Skip the interactive Node.js setup and install the portable runtime under the
+  application directory directly. Useful for unattended installs.
 #>
 [CmdletBinding()]
 param(
@@ -59,7 +65,8 @@ param(
   [switch]$NoWindow,
   [string]$Browser = 'edge',
   [switch]$Uninstall,
-  [switch]$NoSync
+  [switch]$NoSync,
+  [switch]$SilentNodeInstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -409,22 +416,195 @@ function Install-NodeRuntime {
 
 <#
 .SYNOPSIS
+  Download the official Node.js installer for this machine.
+.DESCRIPTION
+  The .msi is the same package nodejs.org offers for a manual install, so the
+  setup wizard can run and the install folder can be chosen. The download is
+  accepted only after its SHA256 matches the published sums file from the same
+  source, and nodejs.org falls back to the npmmirror binary mirror.
+  Returns the installer path with its version, or null when every source failed.
+.PARAMETER InstallDir
+  Installation directory that receives the downloaded installer.
+#>
+function Get-NodeInstaller {
+  param([string]$InstallDir)
+  $arch = Get-NodeArchitectureName
+  $lines = if ($arch -eq 'x86') { @('latest-v22.x') } else { @('latest-v24.x', 'latest-v22.x') }
+  $sources = @(
+    'https://nodejs.org/dist',
+    'https://registry.npmmirror.com/-/binary/node'
+  )
+  foreach ($line in $lines) {
+    foreach ($source in $sources) {
+      $sumsUri = "$source/$line/SHASUMS256.txt"
+      try {
+        $sums = [Text.Encoding]::UTF8.GetString((Get-RemoteBytes -Uri $sumsUri))
+      } catch {
+        Write-Note "node download list unavailable ($source/$line): $($_.Exception.Message)"
+        continue
+      }
+      $match = [regex]::Match($sums, "^([0-9a-fA-F]{64})\s+node-(v[0-9][0-9.]*)-$arch\.msi", 'Multiline')
+      if (-not $match.Success) {
+        Write-Note "no $arch installer is listed for $line on $source"
+        continue
+      }
+      $expected = $match.Groups[1].Value.ToUpperInvariant()
+      $version = $match.Groups[2].Value
+      $msiName = "node-$version-$arch.msi"
+      $msiPath = Join-Path $InstallDir $msiName
+      Write-Note "downloading $msiName from $source"
+      try {
+        Save-RemoteFile -Uri "$source/$line/$msiName" -Path $msiPath
+      } catch {
+        Write-Note "download failed: $($_.Exception.Message)"
+        continue
+      }
+      $actual = (Get-FileHash -LiteralPath $msiPath -Algorithm SHA256).Hash
+      if ($actual -ne $expected) {
+        Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+        Write-Note "checksum mismatch for $msiName; discarding the download"
+        continue
+      }
+      return @{ Path = $msiPath; Version = $version }
+    }
+  }
+  return $null
+}
+
+<#
+.SYNOPSIS
+  Find node.exe after an interactive Node.js setup.
+.DESCRIPTION
+  The setup wizard lets the install folder be chosen freely, so the standard
+  locations are not enough: the InstallPath the package records in the
+  registry is authoritative, with the default folders and PATH as fallbacks.
+.PARAMETER InstallDir
+  Installation directory that holds a portable runtime from earlier launches.
+#>
+function Find-InstalledNodeExe {
+  param([string]$InstallDir)
+  $candidates = New-Object System.Collections.Generic.List[string]
+  foreach ($key in @('HKLM:\SOFTWARE\Node.js', 'HKLM:\SOFTWARE\WOW6432Node\Node.js', 'HKCU:\SOFTWARE\Node.js')) {
+    try {
+      $value = (Get-ItemProperty -LiteralPath $key -Name InstallPath -ErrorAction Stop).InstallPath
+      if (-not [string]::IsNullOrWhiteSpace($value)) {
+        $exe = Join-Path ([Environment]::ExpandEnvironmentVariables($value).TrimEnd('\')) 'node.exe'
+        $candidates.Add($exe)
+      }
+    } catch {
+      continue
+    }
+  }
+  foreach ($fallback in @(Get-NodeExe) + @(Get-ManagedNodeExe -InstallDir $InstallDir)) {
+    if ([string]::IsNullOrWhiteSpace($fallback)) { continue }
+    $candidates.Add($fallback)
+  }
+  foreach ($candidate in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+    $info = Get-NodeRuntimeInfo -NodeExe $candidate
+    if ($null -ne $info -and $info.Supported) { return $candidate }
+  }
+  return $null
+}
+
+<#
+.SYNOPSIS
+  Run the official Node.js setup so the install can be customized.
+.DESCRIPTION
+  The setup wizard is shown on the interactive desktop, so the install folder
+  and per-machine options are the user's choice. A cancelled wizard, a refused
+  elevation, or a failed setup reports failure and the caller falls back to the
+  portable runtime; success is confirmed by reading the runtime the package
+  recorded, not by the exit code alone.
+.PARAMETER InstallerPath
+  Verified .msi downloaded for this machine.
+.PARAMETER InstallDir
+  Installation directory that holds a portable runtime from earlier launches.
+#>
+function Install-NodeWithSetup {
+  param([string]$InstallerPath, [string]$InstallDir)
+  Write-Step 'Opening the Node.js setup wizard (choose the install folder there)'
+  try {
+    $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @('/i', "`"$InstallerPath`"") -PassThru
+  } catch {
+    # A declined elevation prompt surfaces as an exception here, not an exit code.
+    Write-Note "the setup could not start: $($_.Exception.Message)"
+    return $null
+  }
+  if ($null -eq $process) {
+    Write-Note 'the setup did not start'
+    return $null
+  }
+  Write-Note 'waiting for the setup wizard to finish'
+  $process.WaitForExit()
+  switch ($process.ExitCode) {
+    0 { }
+    3010 { Write-Note 'the setup asks for a restart before the next Windows start' }
+    1602 { Write-Note 'the setup was cancelled'; return $null }
+    1603 { Write-Note 'the setup reported a fatal error'; return $null }
+    1618 { Write-Note 'another Windows installer is already running'; return $null }
+    default { Write-Note "the setup exited with code $($process.ExitCode)" }
+  }
+  $exe = Find-InstalledNodeExe -InstallDir $InstallDir
+  if ($null -eq $exe) {
+    Write-Note 'the setup finished but no supported Node.js runtime was found'
+    return $null
+  }
+  Write-Note "Node.js installed at $exe"
+  return $exe
+}
+
+<#
+.SYNOPSIS
   Pick the node.exe this launch should use, installing one when needed.
 .DESCRIPTION
   An installed Node.js in the supported range is used as-is. Otherwise the
-  managed runtime is preferred, and when neither exists one is installed for
-  this machine. Reports the version alongside the path so the caller can print
-  what actually runs.
+  official setup wizard runs first so the install folder can be chosen by hand.
+  When the wizard is skipped (no desktop, approved silent install) or does not
+  produce a usable runtime, the portable runtime under the installation
+  directory is installed instead. Reports the version alongside the path so the
+  caller can print what actually runs.
 .PARAMETER InstallDir
   Installation directory that receives a managed runtime and holds earlier ones.
+.PARAMETER SkipSetup
+  Do not open the setup wizard; install the portable runtime directly.
 #>
 function Resolve-SupportedNode {
-  param([string]$InstallDir)
-  foreach ($candidate in @(Get-NodeExe) + @(Get-ManagedNodeExe -InstallDir $InstallDir)) {
-    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-    $info = Get-NodeRuntimeInfo -NodeExe $candidate
+  param([string]$InstallDir, [switch]$SkipSetup)
+  # The registry records where the Node.js setup actually placed its runtime, so
+  # a folder chosen by hand keeps working on later launches even before the new
+  # PATH reaches this process.
+  $known = Find-InstalledNodeExe -InstallDir $InstallDir
+  if ($null -ne $known) {
+    $info = Get-NodeRuntimeInfo -NodeExe $known
     if ($null -ne $info -and $info.Supported) {
-      return @{ Exe = $candidate; Version = $info.Version }
+      return @{ Exe = $known; Version = $info.Version }
+    }
+  }
+  if (-not $SkipSetup) {
+    $installer = $null
+    if ([Environment]::UserInteractive) {
+      try {
+        $installer = Get-NodeInstaller -InstallDir $InstallDir
+      } catch {
+        Write-Note "could not fetch the Node.js installer: $($_.Exception.Message)"
+      }
+    } else {
+      Write-Note 'no interactive desktop; installing the portable runtime instead'
+    }
+    if ($null -ne $installer) {
+      try {
+        $guided = Install-NodeWithSetup -InstallerPath $installer.Path -InstallDir $InstallDir
+      } finally {
+        Remove-Item -LiteralPath $installer.Path -Force -ErrorAction SilentlyContinue
+      }
+      if ($null -ne $guided) {
+        $info = Get-NodeRuntimeInfo -NodeExe $guided
+        if ($null -ne $info -and $info.Supported) {
+          return @{ Exe = $guided; Version = $info.Version }
+        }
+      }
+      Write-Note 'falling back to the portable Node.js runtime under the installation directory'
     }
   }
   Write-Step 'Installing Node.js for this machine (once; about 30 MB)'
@@ -816,7 +996,7 @@ function Invoke-Launcher {
     }
   }
 
-  $runtime = Resolve-SupportedNode -InstallDir $AppDir
+  $runtime = Resolve-SupportedNode -InstallDir $AppDir -SkipSetup:$SilentNodeInstall
   if ($null -eq $runtime) {
     throw 'No supported Node.js runtime is available and the automatic install failed. Install Node.js 22.19+ or 24+ from https://nodejs.org/ and run this script again.'
   }
