@@ -78,6 +78,17 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 
 ## 使用
 
+### 托盘
+
+启动后会常驻一个**通知区域图标**：
+
+- **关闭窗口不会关闭任务**：服务继续在后台跑，再用托盘把窗口叫回来即可
+- **左键单击**托盘图标：打开/前置窗口
+- **右键**打开菜单：Open Window、Open in Browser、Restart Server、Copy URL、
+  Open Log、Open Install Folder、**Exit（停止服务）**
+- **只有 Exit 会真正停止服务**；重复双击快捷方式不会叠加第二个图标，会把已有窗口提到前面
+- 想不要托盘（回到旧行为）：加 `-NoTray`
+
 ### 快捷方式
 
 双击 **DeepSeek Harness**。已经有一个实例在运行时，脚本会复用该实例而不是再起一个。
@@ -111,6 +122,7 @@ irm https://raw.githubusercontent.com/dieWehmut/dsh-shortcut/main/install.ps1 | 
 | `-Uninstall` | 关闭 | 删除安装目录和快捷方式（保留 `~/.dsh` 数据） |
 | `-NoSync` | 关闭 | 跳过与仓库的比对，直接用本机副本启动 |
 | `-SilentNodeInstall` | 关闭 | 不弹 Node.js 安装向导，直接静默安装便携运行时（适合无人值守） |
+| `-NoTray` | 关闭 | 不常驻托盘图标（关闭窗口后不提供叫回窗口和停止服务的入口） |
 
 > 注意：便携运行时会随 `-Uninstall` 一起删除（它就在安装目录里）；用官方安装向导装的
 > Node.js 是系统级安装，卸载脚本不会动它，需要的话请从「应用和功能」里卸载。

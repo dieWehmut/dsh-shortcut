@@ -56,6 +56,14 @@
 .PARAMETER SilentNodeInstall
   Skip the interactive Node.js setup and install the portable runtime under the
   application directory directly. Useful for unattended installs.
+
+.PARAMETER NoTray
+  Do not keep a tray icon after the window opens. Closing the window then
+  leaves the server running as before; without this switch the launcher stays
+  in the tray, where the window can be reopened and the server can be stopped.
+
+.PARAMETER TraySelfTest
+  Open the tray, report what it built, and exit. Used by the test suite.
 #>
 [CmdletBinding()]
 param(
@@ -66,7 +74,9 @@ param(
   [string]$Browser = 'edge',
   [switch]$Uninstall,
   [switch]$NoSync,
-  [switch]$SilentNodeInstall
+  [switch]$SilentNodeInstall,
+  [switch]$NoTray,
+  [switch]$TraySelfTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -875,6 +885,22 @@ function Read-ServerUrl {
   return $null
 }
 
+<#
+.SYNOPSIS
+  Claim the single tray slot for this installation.
+.DESCRIPTION
+  A second shortcut click must not stack a second tray icon beside the running
+  one. The mutex is held for the life of the tray process and released when it
+  exits, so a later launch can take the slot again.
+.PARAMETER InstallDir
+  Installation directory whose tray is being guarded.
+#>
+function Enter-DshTraySlot {
+  param([string]$InstallDir)
+  $name = 'Local\dsh-shortcut-tray-' + ($InstallDir -replace '[\\/:*?"<>|]', '-')
+  return (New-Object System.Threading.Mutex($false, $name))
+}
+
 function New-Shortcuts {
   param([string]$ScriptPath, [string]$IconPath)
   $shell = New-Object -ComObject WScript.Shell
@@ -905,6 +931,8 @@ function Initialize-WindowApi {
 [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 "@
 }
@@ -949,7 +977,27 @@ function Confirm-WindowVisible {
 }
 
 function Invoke-Uninstall {
-  param([string]$InstallDir)
+  param([string]$InstallDir, [int]$Port = 3080)
+  # A tray left running would keep the server and its window alive past the
+  # uninstall, and a running server holds files in the installation directory.
+  $slot = Enter-DshTraySlot -InstallDir $InstallDir
+  $trayRunning = $false
+  try {
+    $trayRunning = -not $slot.WaitOne(0)
+  } catch [System.Threading.AbandonedMutexException] {
+    $trayRunning = $false
+  } finally {
+    if (-not $trayRunning) {
+      try { $slot.ReleaseMutex() } catch { }
+    }
+    $slot.Dispose()
+  }
+  if ($trayRunning) {
+    Write-Note 'a tray icon is still running; use its Exit item first so the server stops cleanly'
+  }
+  if (Stop-ManagedPortOwner -Port $Port -InstallDir $InstallDir) {
+    Write-Note 'the harness server was stopped'
+  }
   foreach ($name in @($ShortcutName)) {
     $paths = @(
       (Join-Path ([Environment]::GetFolderPath('Desktop')) "$name.lnk"),
@@ -971,11 +1019,289 @@ function Invoke-Uninstall {
   Write-Step 'Uninstalled. Your Harness data under ~/.dsh was left in place.'
 }
 
+# ---- tray ------------------------------------------------------------------
+
+# The tray menu acts on the launch this process performed, so its state lives
+# in script scope where the event handlers can read it.
+$script:TrayState = $null
+
+<#
+.SYNOPSIS
+  Start the harness server and record its authenticated URL.
+.DESCRIPTION
+  The launch token is minted per process and printed once, so the URL and the
+  server pid are written next to the log before the caller opens a window. A
+  later launch uses those records to reuse this server instead of starting a
+  second one.
+.PARAMETER NodeExe
+  Runtime that runs the dsh entry point.
+.PARAMETER BinPath
+  The dsh entry point inside the installation directory.
+.PARAMETER Port
+  Loopback port to listen on.
+.PARAMETER InstallDir
+  Installation directory that receives the log and the launch records.
+#>
+function Start-DshServer {
+  param([string]$NodeExe, [string]$BinPath, [int]$Port, [string]$InstallDir)
+  $log = Join-Path $InstallDir "server-$Port.log"
+  $logErr = Join-Path $InstallDir "server-$Port.err.log"
+  Write-Step "Starting dsh web on port $Port"
+  $arguments = @($BinPath, 'web', '--no-open', '--port', "$Port")
+  $process = Start-Process -FilePath $NodeExe -ArgumentList $arguments `
+    -RedirectStandardOutput $log -RedirectStandardError $logErr `
+    -PassThru -WindowStyle Hidden
+  Write-Note "server pid $($process.Id); log $log"
+  $url = Read-ServerUrl -LogPath $log
+  if ($null -eq $url) {
+    throw "the server did not report a URL; see $log and $logErr"
+  }
+  Set-Content -LiteralPath (Join-Path $InstallDir "server-$Port.url") -Value $url -Encoding ASCII -NoNewline
+  Set-Content -LiteralPath (Join-Path $InstallDir "server-$Port.pid") -Value "$($process.Id)" -Encoding ASCII -NoNewline
+  return $url
+}
+
+<#
+.SYNOPSIS
+  The application window, when one is open.
+.DESCRIPTION
+  The window is a Chromium app window owned by Edge or Chrome. The harness page
+  titles itself DeepSeek Harness; an unauthenticated page has no title and shows
+  the address instead, so both are recognized.
+#>
+function Get-DshAppWindow {
+  param([string]$ProfileDir)
+  $candidates = @(Get-Process msedge, chrome -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match 'DeepSeek Harness|DSH|127\.0\.0\.1' })
+  if ($candidates.Count -eq 0) { return $null }
+  if (-not [string]::IsNullOrWhiteSpace($ProfileDir)) {
+    # Prefer the window served from this installation's own browser profile;
+    # another Chromium window may merely carry a loopback title.
+    foreach ($candidate in $candidates) {
+      $info = Get-CimInstance Win32_Process -Filter "ProcessId=$($candidate.Id)" -ErrorAction SilentlyContinue
+      if ($null -ne $info -and -not [string]::IsNullOrWhiteSpace($info.CommandLine) -and $info.CommandLine.Contains($ProfileDir)) {
+        return $candidate
+      }
+    }
+  }
+  return $candidates[0]
+}
+
+<#
+.SYNOPSIS
+  Bring the application window back, opening one when it was closed.
+.DESCRIPTION
+  Closing the window never stops the server; the tray icon is the way back in.
+  A restored window is raised, and a missing window is started again with the
+  recorded authenticated URL.
+#>
+function Show-DshWindow {
+  $window = Get-DshAppWindow -ProfileDir $script:TrayState.ProfileDir
+  if ($null -ne $window) {
+    Initialize-WindowApi
+    [void][Dsh.Win32]::ShowWindow($window.MainWindowHandle, 9)
+    [void][Dsh.Win32]::SetForegroundWindow($window.MainWindowHandle)
+    return
+  }
+  Start-DshAppWindow
+}
+
+<#
+.SYNOPSIS
+  Open the application window for the recorded URL.
+.DESCRIPTION
+  Uses the browser and profile recorded at launch, with the same size and
+  position, so a window opened from the tray is the window the shortcut opens.
+#>
+function Start-DshAppWindow {
+  $state = $script:TrayState
+  if ($null -eq $state) { return }
+  if ($null -eq $state.BrowserExe) {
+    Start-Process $state.Url | Out-Null
+    return
+  }
+  Write-Note "application window via $(Split-Path -Leaf $state.BrowserExe)"
+  Start-Process -FilePath $state.BrowserExe -ArgumentList @(
+    "--app=$($state.Url)",
+    "--window-size=$($state.Width),$($state.Height)",
+    "--window-position=$($state.Left),$($state.Top)",
+    '--no-first-run',
+    "--user-data-dir=$($state.ProfileDir)"
+  ) | Out-Null
+  Confirm-WindowVisible -Area $state.Area
+}
+
+function Close-DshAppWindow {
+  $profileDir = $null
+  if ($null -ne $script:TrayState) { $profileDir = $script:TrayState.ProfileDir }
+  $window = Get-DshAppWindow -ProfileDir $profileDir
+  if ($null -eq $window) { return }
+  try { [void]$window.CloseMainWindow() } catch { Write-Note 'the window was already closed' }
+}
+
+<#
+.SYNOPSIS
+  Stop the managed server and start a fresh one.
+.DESCRIPTION
+  Restarting mints a new launch token, so the window is reopened with the new
+  URL. A server this installation did not start is left alone.
+#>
+function Restart-DshTrayServer {
+  $state = $script:TrayState
+  if ($null -eq $state) { return }
+  if (-not (Stop-ManagedPortOwner -Port $state.Port -InstallDir $state.AppDir)) {
+    Write-Note 'the running server was not started by this installation; not restarting it'
+    return
+  }
+  try {
+    $state.Url = Start-DshServer -NodeExe $state.Node -BinPath $state.Bin -Port $state.Port -InstallDir $state.AppDir
+  } catch {
+    Write-Note "the restart failed: $($_.Exception.Message)"
+    return
+  }
+  Write-Note "restarted; Ready: $($state.Url)"
+  Close-DshAppWindow
+  Start-DshAppWindow
+}
+
+<#
+.SYNOPSIS
+  Leave the tray and stop the server this installation started.
+.DESCRIPTION
+  The tray is the only place that stops the task, so this is what the Exit menu
+  item runs: the managed server is stopped, the window is closed, and the
+  message loop ends.
+#>
+function Exit-DshTray {
+  $state = $script:TrayState
+  if ($null -ne $state) {
+    if (Stop-ManagedPortOwner -Port $state.Port -InstallDir $state.AppDir) {
+      Write-Note 'the server was stopped'
+    } else {
+      Write-Note 'the server was not started by this installation; leaving it running'
+    }
+    Close-DshAppWindow
+  }
+  try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    [System.Windows.Forms.Application]::ExitThread()
+  } catch {
+    Write-Note 'the tray loop is not running; nothing to exit'
+  }
+}
+
+<#
+.SYNOPSIS
+  Build the tray context menu.
+.DESCRIPTION
+  Left clicking the icon opens the window; this menu is the right-click side:
+  the window, the browser, a server restart, the URL, the log, the installation
+  folder, and the exit that stops the server.
+#>
+function New-DshTrayMenu {
+  $menu = New-Object System.Windows.Forms.ContextMenuStrip
+  $openItem = $menu.Items.Add('Open Window')
+  $browserItem = $menu.Items.Add('Open in Browser')
+  $restartItem = $menu.Items.Add('Restart Server')
+  $copyItem = $menu.Items.Add('Copy URL')
+  $logItem = $menu.Items.Add('Open Log')
+  $folderItem = $menu.Items.Add('Open Install Folder')
+  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  $exitItem = $menu.Items.Add('Exit (stop server)')
+  $openItem.add_Click({ Show-DshWindow })
+  $browserItem.add_Click({ Start-Process $script:TrayState.Url | Out-Null })
+  $restartItem.add_Click({ Restart-DshTrayServer })
+  $copyItem.add_Click({ [System.Windows.Forms.Clipboard]::SetText($script:TrayState.Url) })
+  $logItem.add_Click({ Start-Process $script:TrayState.LogPath | Out-Null })
+  $folderItem.add_Click({ Start-Process $script:TrayState.AppDir | Out-Null })
+  $exitItem.add_Click({ Exit-DshTray })
+  return $menu
+}
+
+<#
+.SYNOPSIS
+  Report what the tray builds without entering its message loop.
+.DESCRIPTION
+  Confirms the icon loads and the menu is complete, so the test suite can check
+  the tray on a build machine without leaving an icon behind.
+.PARAMETER State
+  Launch state the tray would act on.
+#>
+function Test-DshTray {
+  param([hashtable]$State)
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+  $script:TrayState = $State
+  $icon = New-Object System.Drawing.Icon($State.IconPath)
+  try {
+    Write-Note "tray icon loaded: $($icon.Width)x$($icon.Height)"
+    $notify = New-Object System.Windows.Forms.NotifyIcon
+    try {
+      $notify.Icon = $icon
+      $notify.Text = 'DeepSeek Harness'
+      $menu = New-DshTrayMenu
+      try {
+        $notify.ContextMenuStrip = $menu
+        Write-Note "tray menu items: $($menu.Items.Count)"
+      } finally {
+        $notify.ContextMenuStrip = $null
+        $menu.Dispose()
+      }
+    } finally {
+      $notify.Dispose()
+    }
+  } finally {
+    $icon.Dispose()
+  }
+}
+
+<#
+.SYNOPSIS
+  Keep the launcher in the notification area while the server runs.
+.DESCRIPTION
+  Closing the window does not stop the task; this is the window's way back and
+  the only place that stops the server. Left clicking the icon opens the window,
+  right clicking shows the menu, and the loop ends with the Exit item.
+.PARAMETER State
+  Launch state the menu acts on.
+#>
+function Start-DshTray {
+  param([hashtable]$State)
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+  [System.Windows.Forms.Application]::EnableVisualStyles()
+  $script:TrayState = $State
+  $icon = $null
+  if (Test-Path -LiteralPath $State.IconPath) {
+    $icon = New-Object System.Drawing.Icon($State.IconPath)
+  }
+  $notify = New-Object System.Windows.Forms.NotifyIcon
+  $notify.Icon = if ($null -ne $icon) { $icon } else { [System.Drawing.SystemIcons]::Application }
+  $notify.Text = 'DeepSeek Harness'
+  $menu = New-DshTrayMenu
+  $notify.ContextMenuStrip = $menu
+  $notify.add_MouseClick({
+    param($sender, $eventArgs)
+    if ($eventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Show-DshWindow }
+  })
+  $notify.Visible = $true
+  Write-Note 'tray icon active: left-click opens the window, right-click shows the menu'
+  try {
+    [System.Windows.Forms.Application]::Run()
+  } finally {
+    $notify.Visible = $false
+    $notify.ContextMenuStrip = $null
+    $menu.Dispose()
+    $notify.Dispose()
+    if ($null -ne $icon) { $icon.Dispose() }
+  }
+}
+
 # ---- main ------------------------------------------------------------------
 
 function Invoke-Launcher {
   if ($Uninstall) {
-    Invoke-Uninstall -InstallDir $AppDir
+    Invoke-Uninstall -InstallDir $AppDir -Port $Port
     return
   }
 
@@ -1026,31 +1352,18 @@ function Invoke-Launcher {
       }
     }
     if ([string]::IsNullOrWhiteSpace($Url)) {
-      $log = Join-Path $AppDir "server-$Port.log"
-      $logErr = Join-Path $AppDir "server-$Port.err.log"
-      Write-Step "Starting dsh web on port $Port"
-      $arguments = @($bin, 'web', '--no-open', '--port', "$Port")
-      $process = Start-Process -FilePath $node -ArgumentList $arguments `
-        -RedirectStandardOutput $log -RedirectStandardError $logErr `
-        -PassThru -WindowStyle Hidden
-      Write-Note "server pid $($process.Id); log $log"
-      $Url = Read-ServerUrl -LogPath $log
-      if ($null -eq $Url) {
-        throw "the server did not report a URL; see $log and $logErr"
-      }
-      Set-Content -LiteralPath (Join-Path $AppDir "server-$Port.url") -Value $Url -Encoding ASCII -NoNewline
-      Set-Content -LiteralPath (Join-Path $AppDir "server-$Port.pid") -Value "$($process.Id)" -Encoding ASCII -NoNewline
+      $Url = Start-DshServer -NodeExe $node -BinPath $bin -Port $Port -InstallDir $AppDir
     }
   }
 
   Write-Step "Ready: $Url"
 
-  if ($NoWindow) { return }
+  if ($NoWindow -and -not $TraySelfTest) { return }
 
   $browserExe = Get-BrowserExe -Preference $Browser
   if ($null -eq $browserExe) {
     Write-Note 'no Edge or Chrome found; opening the default browser instead'
-    Start-Process $Url | Out-Null
+    if (-not $TraySelfTest) { Start-Process $Url | Out-Null }
     return
   }
 
@@ -1063,16 +1376,51 @@ function Invoke-Launcher {
   $height = [Math]::Min(900, [int]($area.Height * 0.94))
   $left = [int]($area.X + ($area.Width - $width) / 2)
   $top = [int]($area.Y + ($area.Height - $height) / 2)
-  Write-Note "application window via $(Split-Path -Leaf $browserExe): ${width}x${height} at ($left,$top)"
   $profileDir = Join-Path $AppDir 'browser-profile'
-  Start-Process -FilePath $browserExe -ArgumentList @(
-    "--app=$Url",
-    "--window-size=$width,$height",
-    "--window-position=$left,$top",
-    '--no-first-run',
-    "--user-data-dir=$profileDir"
-  ) | Out-Null
-  Confirm-WindowVisible -Area $area
+  $state = @{
+    Url = $Url
+    Port = $Port
+    AppDir = $AppDir
+    Node = $node
+    Bin = $bin
+    BrowserExe = $browserExe
+    ProfileDir = $profileDir
+    IconPath = $iconPath
+    LogPath = (Join-Path $AppDir "server-$Port.log")
+    Area = $area
+    Width = $width
+    Height = $height
+    Left = $left
+    Top = $top
+  }
+  if ($TraySelfTest) {
+    Test-DshTray -State $state
+    return
+  }
+  $script:TrayState = $state
+  Write-Note "application window via $(Split-Path -Leaf $browserExe): ${width}x${height} at ($left,$top)"
+  if (-not $NoTray) {
+    $slot = Enter-DshTraySlot -InstallDir $AppDir
+    $owned = $false
+    try {
+      $owned = $slot.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+      # The previous tray process ended without releasing the slot.
+      $owned = $true
+    }
+    if (-not $owned) {
+      # Another tray already runs for this installation: show its window and
+      # leave the task with it instead of stacking a second icon.
+      Write-Note 'the tray is already running; showing its window'
+      $slot.Dispose()
+      Show-DshWindow
+      return
+    }
+    # Hold the slot for the life of this process; released when it exits.
+    $script:TraySlot = $slot
+  }
+  Start-DshAppWindow
+  if (-not $NoTray) { Start-DshTray -State $state }
 }
 
 try {
