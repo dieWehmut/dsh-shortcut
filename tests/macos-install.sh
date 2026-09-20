@@ -4,8 +4,15 @@ set -eu
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dsh-install-tests.XXXXXX")"
+# macOS resolves /var and /tmp through symlinks, and the installer compares
+# physical paths; resolve the fixture root once so expectations match it.
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
 cleanup() {
-  case "$TEST_ROOT" in "${TMPDIR:-/tmp}"/dsh-install-tests.*) rm -rf "$TEST_ROOT" ;; esac
+  # Only the private directory returned by mktemp above is ever removed.
+  case "$TEST_ROOT" in
+    */dsh-install-tests.??????) rm -rf -- "$TEST_ROOT" ;;
+    *) printf 'Refusing to remove unexpected test path: %s\n' "$TEST_ROOT" >&2 ;;
+  esac
 }
 trap cleanup EXIT
 
