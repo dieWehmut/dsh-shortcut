@@ -19,7 +19,7 @@
 # Usage:
 #   dsh-window.sh [--port N] [--app-dir DIR] [--browser chrome|edge|brave|PATH]
 #                 [--url URL] [--no-window] [--no-sync] [--uninstall]
-#                 [--no-tray] [--self-test]
+#                 [--no-tray] [--silent-node-install] [--self-test]
 #
 # The menu bar icon calls this same script with --open-window, --open-browser,
 # --restart, --copy-url, --open-log, --open-folder, or --stop, so those flags
@@ -42,6 +42,7 @@ NO_SYNC=0
 UNINSTALL=0
 SELF_TEST=0
 NO_TRAY=0
+SILENT_NODE_INSTALL=0
 ACTION=''
 EXTERNAL_URL=''
 
@@ -64,6 +65,7 @@ while [ $# -gt 0 ]; do
     --uninstall) UNINSTALL=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
     --no-tray) NO_TRAY=1; shift ;;
+    --silent-node-install) SILENT_NODE_INSTALL=1; shift ;;
     --open-window) ACTION='open-window'; shift ;;
     --open-browser) ACTION='open-browser'; shift ;;
     --restart) ACTION='restart'; shift ;;
@@ -130,91 +132,137 @@ node_arch() {
   esac
 }
 
-# Locations Node.js is commonly installed to on macOS, then PATH.
+# Skip unsupported installations, including an old node earlier on PATH.
 find_node_exe() {
-  local candidate on_path
-  for candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node "${HOME}/.volta/bin/node"; do
-    [ -x "$candidate" ] && { printf '%s' "$candidate"; return 0; }
-  done
-  on_path="$(command -v node 2>/dev/null || true)"
-  [ -n "$on_path" ] && { printf '%s' "$on_path"; return 0; }
-  return 1
-}
-
-# A portable runtime this launcher installed lives under the application
-# directory, so it needs no PATH entry.
-find_managed_node_exe() {
-  local install_dir="$1" root candidate
-  root="${install_dir}/node"
-  [ -d "$root" ] || return 1
-  for candidate in $(find "$root" -maxdepth 3 -name node -type f 2>/dev/null || true); do
-    if [ -n "$(node_version_supported "$candidate" || true)" ]; then
+  local candidate directory
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node \
+      /opt/homebrew/opt/node@24/bin/node /usr/local/opt/node@24/bin/node \
+      /opt/homebrew/opt/node@22/bin/node /usr/local/opt/node@22/bin/node \
+      "${HOME}/.volta/bin/node"; do
+    if node_version_supported "$candidate" >/dev/null 2>&1; then
       printf '%s' "$candidate"
       return 0
     fi
   done
+  while IFS= read -r directory; do
+    candidate="${directory:-.}/node"
+    if node_version_supported "$candidate" >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done < <(printf '%s\n' "${PATH:-}" | tr ':' '\n')
   return 1
 }
 
-# Install a Node.js runtime matched to this machine.
-#
-# The official .pkg opens the standard installer so the destination can be
-# chosen; when that is skipped or fails, the archive for this CPU ships as a
-# portable runtime under the application directory. Every download is accepted
-# only after its SHA256 matches the published sums from the same source.
-install_node_runtime() {
-  local install_dir="$1" arch line source sums pkg_line expected version found tarball pkg
-  arch="$(node_arch)"
-  found=''
+# A selected external runtime is remembered without changing the user's PATH.
+# Its record belongs to this application; the external runtime does not.
+find_managed_node_exe() {
+  local install_dir="$1" root candidate
+  if [ -f "${install_dir}/node-runtime.path" ]; then
+    candidate=''
+    IFS= read -r candidate < "${install_dir}/node-runtime.path" || true
+    if node_version_supported "$candidate" >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  fi
+  root="${install_dir}/node"
+  [ -d "$root" ] || return 1
+  while IFS= read -r -d '' candidate; do
+    if node_version_supported "$candidate" >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done < <(find "$root" -maxdepth 3 -name node -type f -print0 2>/dev/null)
+  return 1
+}
 
-  for line in latest-v24.x latest-v22.x; do
+# Let the user choose the portable runtime's parent folder. AppleScript receives
+# paths as arguments, so spaces and quotes never become executable script text.
+node_install_root() {
+  local install_dir="$1" selected=''
+  if [ "${DESKTOP:-1}" = '1' ] && [ "${SILENT_NODE_INSTALL:-0}" != '1' ] && command -v osascript >/dev/null 2>&1; then
+    step 'Choose a folder for Node.js (Cancel uses the application folder)'
+    selected="$(osascript - "$install_dir" 2>/dev/null <<'APPLESCRIPT'
+on run argv
+  activate
+  set chosenFolder to choose folder with prompt "Choose where to install Node.js. A dsh-node-runtime folder will be created there. Cancel installs inside the application folder." default location (POSIX file (item 1 of argv))
+  return POSIX path of chosenFolder
+end run
+APPLESCRIPT
+    )" || selected=''
+  fi
+  if [ -n "$selected" ]; then
+    printf '%s' "${selected%/}/dsh-node-runtime"
+  else
+    printf '%s' "${install_dir}/node"
+  fi
+}
+
+# Install the CPU-specific portable archive, preferring v24 then v22. Every
+# source must publish the matching SHA256 before its archive can be extracted.
+install_node_runtime() {
+  local install_dir="$1" arch major line source sums archive_line expected archive
+  local runtime_root tarball staging destination found record_tmp
+  mkdir -p "$install_dir" || return 1
+  install_dir="$(cd "$install_dir" && pwd -P)" || return 1
+  arch="$(node_arch)"
+  runtime_root="$(node_install_root "$install_dir")"
+  if ! mkdir -p "$runtime_root" || [ ! -w "$runtime_root" ]; then
+    note 'the selected folder is not writable; using the application folder'
+    runtime_root="${install_dir}/node"
+    mkdir -p "$runtime_root" || return 1
+  fi
+  runtime_root="$(cd "$runtime_root" && pwd -P)" || return 1
+  for major in 24 22; do
+    line="latest-v${major}.x"
     for source in https://nodejs.org/dist https://registry.npmmirror.com/-/binary/node; do
       sums="$(fetch_text "${source}/${line}/SHASUMS256.txt" 2>/dev/null || true)"
       [ -n "$sums" ] || continue
-      # Prefer the interactive installer: it lets the destination be chosen.
-      pkg_line="$(printf '%s' "$sums" | grep -E "node-v[0-9.]+\.pkg$" | head -n 1 || true)"
-      if [ -n "$pkg_line" ]; then
-        expected="$(printf '%s' "$pkg_line" | awk '{print $1}')"
-        version="$(printf '%s' "$pkg_line" | awk '{print $2}' | sed -e 's/^node-//' -e 's/\.pkg$//')"
-        if [ "${DESKTOP:-1}" = "1" ] && command -v installer >/dev/null 2>&1; then
-          pkg="${install_dir}/node-${version}.pkg"
-          note "downloading node-${version}.pkg from ${source}"
-          if fetch_file "${source}/${line}/node-${version}.pkg" "$pkg" 2>/dev/null; then
-            if [ "$(sha256_of_file "$pkg")" = "$expected" ]; then
-              step 'Opening the Node.js installer (choose the destination there)'
-              if osascript -e "do shell script \"installer -pkg '${pkg}' -target /\" with administrator privileges" >/dev/null 2>&1; then
-                rm -f "$pkg"
-                found="$(find_node_exe || true)"
-                [ -n "$found" ] && { printf '%s' "$found"; return 0; }
-              else
-                note 'the Node.js installer was cancelled; using the portable runtime instead'
-                rm -f "$pkg"
-              fi
-            else
-              rm -f "$pkg"
-              note 'checksum mismatch for the Node.js installer; discarding it'
-            fi
-          fi
-        fi
+      archive_line="$(printf '%s\n' "$sums" | awk -v major="$major" -v arch="$arch" '
+        length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/ &&
+        $2 ~ ("^node-v" major "\\.[0-9]+\\.[0-9]+-darwin-" arch "\\.tar\\.gz$") {
+          print tolower($1), $2; exit
+        }')"
+      [ -n "$archive_line" ] || continue
+      expected="${archive_line%% *}"
+      archive="${archive_line#* }"
+      tarball="$(mktemp "${install_dir}/node-download.XXXXXX")" || return 1
+      note "downloading ${archive} from ${source}"
+      if ! fetch_file "${source}/${line}/${archive}" "$tarball" 2>/dev/null; then
+        rm -f "$tarball"
+        continue
       fi
-      # Portable runtime for this CPU.
-      pkg_line="$(printf '%s' "$sums" | grep -E "node-v[0-9.]+-darwin-${arch}\.tar\.gz$" | head -n 1 || true)"
-      [ -n "$pkg_line" ] || continue
-      expected="$(printf '%s' "$pkg_line" | awk '{print $1}')"
-      version="$(printf '%s' "$pkg_line" | awk '{print $2}' | sed -e 's/^node-//' -e "s/-darwin-${arch}\.tar\.gz$//")"
-      tarball="${install_dir}/node-${version}-darwin-${arch}.tar.gz"
-      note "downloading node-${version}-darwin-${arch}.tar.gz from ${source}"
-      fetch_file "${source}/${line}/node-${version}-darwin-${arch}.tar.gz" "$tarball" 2>/dev/null || continue
       if [ "$(sha256_of_file "$tarball")" != "$expected" ]; then
         rm -f "$tarball"
         note 'checksum mismatch for the Node.js archive; discarding it'
         continue
       fi
-      mkdir -p "${install_dir}/node"
-      tar -xzf "$tarball" -C "${install_dir}/node"
+      staging="$(mktemp -d "${runtime_root}/node-install.XXXXXX")" || { rm -f "$tarball"; return 1; }
+      if ! tar -xzf "$tarball" -C "$staging" --strip-components=1 || ! node_version_supported "${staging}/bin/node" >/dev/null 2>&1; then
+        rm -f "$tarball"
+        rm -rf "$staging"
+        note 'the Node.js archive could not provide a supported runtime; trying another source'
+        continue
+      fi
       rm -f "$tarball"
-      found="$(find_managed_node_exe "$install_dir" || true)"
-      [ -n "$found" ] && { printf '%s' "$found"; return 0; }
+      destination="${runtime_root}/${archive%.tar.gz}"
+      # Never replace a directory the user already has. The unique staging
+      # directory is also a complete, usable installation if this name exists.
+      if [ -e "$destination" ]; then
+        destination="$staging"
+      elif ! mv "$staging" "$destination"; then
+        rm -rf "$staging"
+        continue
+      fi
+      found="${destination}/bin/node"
+      record_tmp="$(mktemp "${install_dir}/node-runtime.path.XXXXXX")" || return 1
+      if ! printf '%s\n' "$found" > "$record_tmp" || ! mv -f "$record_tmp" "${install_dir}/node-runtime.path"; then
+        rm -f "$record_tmp"
+        return 1
+      fi
+      printf '%s' "$found"
+      return 0
     done
   done
   return 1
@@ -224,13 +272,13 @@ install_node_runtime() {
 node_version_supported() {
   local exe="$1" text major minor
   [ -x "$exe" ] || return 1
-  text="$("$exe" --version 2>/dev/null | sed 's/^v//')"
-  case "$text" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *) return 1 ;;
-  esac
+  text="$("$exe" --version 2>/dev/null)" || return 1
+  case "$text" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  printf '%s\n' "$text" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || return 1
+  text="${text#v}"
   major="${text%%.*}"
-  minor="$(printf '%s' "$text" | cut -d. -f2)"
+  minor="${text#*.}"
+  minor="${minor%%.*}"
   if { [ "$major" -eq 22 ] && [ "$minor" -ge 19 ]; } || [ "$major" -ge 24 ]; then
     printf '%s' "$text"
     return 0
