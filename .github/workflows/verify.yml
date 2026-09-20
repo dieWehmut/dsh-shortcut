@@ -1,0 +1,57 @@
+name: Verify launchers
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Verify native shell and CPU
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          /bin/bash --version
+          test "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}" = 3.2
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+      - name: Run offline behavior tests with Bash 3.2
+        run: |
+          /bin/bash tests/macos-node.sh
+          /bin/bash tests/macos-install.sh
+          /bin/bash tests/macos-launcher.sh
+      - name: Exercise native tray and real server processes
+        run: /bin/bash tests/macos-native.sh
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run Windows launcher regressions
+        shell: powershell
+        run: ./tests/windows-launcher.ps1
