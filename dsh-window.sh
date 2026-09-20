@@ -206,11 +206,12 @@ node_version_supported() {
 }
 
 read_server_url() {
-  local log="$1" attempt text match
+  local log="$1" pid="${2:-}" attempt text match
   attempt=0
   while [ "$attempt" -lt 150 ]; do
     sleep 0.8
     attempt=$((attempt + 1))
+    [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null || return 1
     [ -f "$log" ] || continue
     text="$(cat "$log" 2>/dev/null || true)"
     match="$(printf '%s' "$text" | grep -Eo 'https?://127\.0\.0\.1:[0-9]+/\?token=[^[:space:]]+' | head -n 1 || true)"
@@ -285,32 +286,40 @@ authenticated_server_url() {
 stop_managed_port_owner() {
   local port="$1" install_dir="$2" owner pid_file recorded_pid entry command_text deadline
   owner="$(port_owner_pid "$port")"
-  [ -n "$owner" ] || return 1
+  [ -n "$owner" ] || { ! port_serving "$port"; return $?; }
   pid_file="${install_dir}/server-${port}.pid"
   recorded_pid=""
   [ -f "$pid_file" ] && recorded_pid="$(head -n 1 "$pid_file" 2>/dev/null | tr -d '[:space:]')"
   if [ -n "$recorded_pid" ]; then
     [ "$recorded_pid" = "$owner" ] || return 1
-  else
-    entry="${install_dir}/node_modules/@deepseek-ai/dsh/lib/bin.js"
-    command_text="$(pid_command "$owner")"
-    case "$command_text" in
-      *"$entry"*) ;;
-      *) return 1 ;;
-    esac
   fi
-  note "stopping the previous server (pid ${owner}) to mint a fresh launch token"
+  # A PID can be recycled. Its command must still belong to this installation.
+  entry="${install_dir}/node_modules/@deepseek-ai/dsh/lib/bin.js"
+  command_text="$(pid_command "$owner")"
+  # The entry path has to be one whole argument followed by the web
+  # subcommand: a lookalike path such as bin.js.other is another program.
+  case "$command_text" in
+    "$entry web"|"$entry web "*|*" $entry web"|*" $entry web "*) ;;
+    *) return 1 ;;
+  esac
+  note "stopping the managed server (pid ${owner})"
   kill "$owner" 2>/dev/null || true
   deadline=$(( $(date +%s) + 10 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if ! port_serving "$port"; then
+    if ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$pid_file" "${install_dir}/server-${port}.url"
       return 0
     fi
     sleep 0.25
   done
-  kill -9 "$owner" 2>/dev/null || true
+  # Recheck ownership before escalating, in case the process exited meanwhile.
+  [ "$(pid_command "$owner")" = "$command_text" ] && kill -9 "$owner" 2>/dev/null || true
   sleep 1
-  ! port_serving "$port"
+  if ! port_serving "$port"; then
+    rm -f "$pid_file" "${install_dir}/server-${port}.url"
+    return 0
+  fi
+  return 1
 }
 
 start_dsh_server() {
@@ -318,10 +327,15 @@ start_dsh_server() {
   log="${install_dir}/server-${port}.log"
   log_err="${install_dir}/server-${port}.err.log"
   step "Starting dsh web on port ${port}"
-  nohup "$node_exe" "$bin" web --no-open --port "$port" >"$log" 2>"$log_err" &
+  PATH="$(dirname "$node_exe"):$PATH" nohup "$node_exe" "$bin" web --no-open --port "$port" >"$log" 2>"$log_err" </dev/null &
   pid=$!
+  printf '%s' "$pid" > "${install_dir}/server-${port}.pid"
   note "server pid ${pid}; log ${log}"
-  url="$(read_server_url "$log")" || return 1
+  url="$(read_server_url "$log" "$pid")" || {
+    kill "$pid" 2>/dev/null || true
+    rm -f "${install_dir}/server-${port}.pid" "${install_dir}/server-${port}.url"
+    return 1
+  }
   printf '%s' "$url" > "${install_dir}/server-${port}.url"
   printf '%s' "$pid" > "${install_dir}/server-${port}.pid"
   printf '%s' "$url"
