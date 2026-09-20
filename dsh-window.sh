@@ -601,7 +601,9 @@ install_shortcuts() {
     mkdir -p "$(dirname "$target")"
     {
       printf '#!/bin/bash\n'
-      printf 'exec "%s"\n' "$script_path"
+      printf 'exec /bin/bash %s --app-dir %s --port %s --browser %s' "$(shell_literal "$script_path")" "$(shell_literal "$APP_DIR")" "$PORT" "$(shell_literal "$BROWSER")"
+      [ "$SILENT_NODE_INSTALL" = 0 ] || printf ' --silent-node-install'
+      printf '\n'
     } > "$target"
     chmod +x "$target"
     note "shortcut: ${target}"
