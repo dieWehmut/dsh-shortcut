@@ -797,9 +797,9 @@ function Get-AuthenticatedServerUrl {
 .DESCRIPTION
   When the recorded launch token no longer authenticates, the only way back to
   an authenticated window is a fresh server, because the token is minted per
-  process. A process is treated as managed when its id matches the recorded
-  server-pid record, or when it runs the dsh entry point from this installation;
-  anything else is left alone and the caller reports instead.
+  process. A managed process must run the dsh entry point from this installation
+  and match the recorded server pid when one exists. A pid alone is insufficient
+  because Windows can reuse it after the original server exits.
 .PARAMETER Port
   Loopback port the server listens on.
 .PARAMETER InstallDir
@@ -813,15 +813,15 @@ function Stop-ManagedPortOwner {
   $recorded = (Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
   $recordedPid = $null
   try { $recordedPid = [int]([string]$recorded).Trim() } catch { $recordedPid = $null }
-  if ($null -eq $recordedPid) {
-    # A server started before the launcher recorded pids can still be identified
-    # by its command line: it runs the dsh entry point from this installation.
-    $entry = Join-Path $InstallDir 'node_modules\@deepseek-ai\dsh\lib\bin.js'
-    $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$owner" -ErrorAction SilentlyContinue
-    if ($null -eq $processInfo -or [string]::IsNullOrWhiteSpace($processInfo.CommandLine) -or -not $processInfo.CommandLine.Contains($entry)) {
-      return $false
-    }
-  } elseif ($recordedPid -ne $owner) {
+  if ($null -ne $recordedPid -and $recordedPid -ne $owner) {
+    return $false
+  }
+  # Verify the entry point even when a pid record matches: that process may
+  # have ended and its pid may now belong to an unrelated listener.
+  $entry = Join-Path $InstallDir 'node_modules\@deepseek-ai\dsh\lib\bin.js'
+  $entryArgument = '(?:^|\s)(?:"' + [regex]::Escape($entry) + '"|' + [regex]::Escape($entry) + ')(?=\s|$)'
+  $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$owner" -ErrorAction SilentlyContinue
+  if ($null -eq $processInfo -or [string]::IsNullOrWhiteSpace($processInfo.CommandLine) -or -not [regex]::IsMatch($processInfo.CommandLine, $entryArgument, 'IgnoreCase')) {
     return $false
   }
   try {
@@ -949,12 +949,12 @@ public struct RECT { public int Left; public int Top; public int Right; public i
   Primary screen work area the window must stay inside.
 #>
 function Confirm-WindowVisible {
-  param([System.Drawing.Rectangle]$Area)
+  param([System.Drawing.Rectangle]$Area, [string]$ProfileDir)
+  if ([string]::IsNullOrWhiteSpace($ProfileDir)) { return }
   Initialize-WindowApi
   for ($attempt = 0; $attempt -lt 20; $attempt++) {
     Start-Sleep -Milliseconds 700
-    $candidates = @(Get-Process msedge, chrome -ErrorAction SilentlyContinue |
-      Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match 'DeepSeek Harness|DSH' })
+    $candidates = @(Get-DshAppWindow -ProfileDir $ProfileDir | Where-Object { $null -ne $_ })
     foreach ($window in $candidates) {
       $rect = New-Object Dsh.Win32+RECT
       if (-not [Dsh.Win32]::GetWindowRect($window.MainWindowHandle, [ref]$rect)) { continue }
@@ -1025,6 +1025,18 @@ function Invoke-Uninstall {
 # in script scope where the event handlers can read it.
 $script:TrayState = $null
 
+# Start-Process joins ArgumentList without quoting its elements. Quote each
+# argument using Windows native command-line rules, including quotes and a
+# trailing backslash, so paths under a directory with spaces stay intact.
+function ConvertTo-NativeArgumentString {
+  param([string[]]$Arguments)
+  $quoted = foreach ($argument in $Arguments) {
+    $escaped = $argument -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1'
+    '"' + $escaped + '"'
+  }
+  return $quoted -join ' '
+}
+
 <#
 .SYNOPSIS
   Start the harness server and record its authenticated URL.
@@ -1047,7 +1059,7 @@ function Start-DshServer {
   $log = Join-Path $InstallDir "server-$Port.log"
   $logErr = Join-Path $InstallDir "server-$Port.err.log"
   Write-Step "Starting dsh web on port $Port"
-  $arguments = @($BinPath, 'web', '--no-open', '--port', "$Port")
+  $arguments = ConvertTo-NativeArgumentString -Arguments @($BinPath, 'web', '--no-open', '--port', "$Port")
   $process = Start-Process -FilePath $NodeExe -ArgumentList $arguments `
     -RedirectStandardOutput $log -RedirectStandardError $logErr `
     -PassThru -WindowStyle Hidden
@@ -1075,14 +1087,19 @@ function Get-DshAppWindow {
     Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match 'DeepSeek Harness|DSH|127\.0\.0\.1' })
   if ($candidates.Count -eq 0) { return $null }
   if (-not [string]::IsNullOrWhiteSpace($ProfileDir)) {
-    # Prefer the window served from this installation's own browser profile;
-    # another Chromium window may merely carry a loopback title.
+    # Require this installation's exact --user-data-dir argument; a path
+    # substring or a matching page title does not prove window ownership.
+    $expectedProfile = $ProfileDir.TrimEnd('\', '/')
     foreach ($candidate in $candidates) {
       $info = Get-CimInstance Win32_Process -Filter "ProcessId=$($candidate.Id)" -ErrorAction SilentlyContinue
-      if ($null -ne $info -and -not [string]::IsNullOrWhiteSpace($info.CommandLine) -and $info.CommandLine.Contains($ProfileDir)) {
-        return $candidate
+      if ($null -eq $info -or [string]::IsNullOrWhiteSpace($info.CommandLine)) { continue }
+      $profileArgument = [regex]::Match($info.CommandLine, '(?:^|\s)(?:"--user-data-dir=([^\"]*)"|--user-data-dir(?:=|\s+)(?:"([^\"]*)"|([^\s\"]+)))(?=\s|$)', 'IgnoreCase')
+      if ($profileArgument.Success) {
+        $actualProfile = ($profileArgument.Groups[1].Value + $profileArgument.Groups[2].Value + $profileArgument.Groups[3].Value).TrimEnd('\', '/')
+        if ([string]::Equals($actualProfile, $expectedProfile, [StringComparison]::OrdinalIgnoreCase)) { return $candidate }
       }
     }
+    return $null
   }
   return $candidates[0]
 }
@@ -1121,19 +1138,20 @@ function Start-DshAppWindow {
     return
   }
   Write-Note "application window via $(Split-Path -Leaf $state.BrowserExe)"
-  Start-Process -FilePath $state.BrowserExe -ArgumentList @(
+  $arguments = ConvertTo-NativeArgumentString -Arguments @(
     "--app=$($state.Url)",
     "--window-size=$($state.Width),$($state.Height)",
     "--window-position=$($state.Left),$($state.Top)",
     '--no-first-run',
     "--user-data-dir=$($state.ProfileDir)"
-  ) | Out-Null
-  Confirm-WindowVisible -Area $state.Area
+  )
+  Start-Process -FilePath $state.BrowserExe -ArgumentList $arguments | Out-Null
+  Confirm-WindowVisible -Area $state.Area -ProfileDir $state.ProfileDir
 }
 
 function Close-DshAppWindow {
-  $profileDir = $null
-  if ($null -ne $script:TrayState) { $profileDir = $script:TrayState.ProfileDir }
+  if ($null -eq $script:TrayState -or [string]::IsNullOrWhiteSpace($script:TrayState.ProfileDir)) { return }
+  $profileDir = $script:TrayState.ProfileDir
   $window = Get-DshAppWindow -ProfileDir $profileDir
   if ($null -eq $window) { return }
   try { [void]$window.CloseMainWindow() } catch { Write-Note 'the window was already closed' }
@@ -1149,9 +1167,12 @@ function Close-DshAppWindow {
 function Restart-DshTrayServer {
   $state = $script:TrayState
   if ($null -eq $state) { return }
-  if (-not (Stop-ManagedPortOwner -Port $state.Port -InstallDir $state.AppDir)) {
-    Write-Note 'the running server was not started by this installation; not restarting it'
-    return
+  $owner = Get-PortOwnerProcessId -Candidate $state.Port
+  if ($null -ne $owner -or (Test-PortServing -Candidate $state.Port)) {
+    if (-not (Stop-ManagedPortOwner -Port $state.Port -InstallDir $state.AppDir)) {
+      Write-Note 'the running server was not started by this installation; not restarting it'
+      return
+    }
   }
   try {
     $state.Url = Start-DshServer -NodeExe $state.Node -BinPath $state.Bin -Port $state.Port -InstallDir $state.AppDir
@@ -1363,8 +1384,6 @@ function Invoke-Launcher {
   $browserExe = Get-BrowserExe -Preference $Browser
   if ($null -eq $browserExe) {
     Write-Note 'no Edge or Chrome found; opening the default browser instead'
-    if (-not $TraySelfTest) { Start-Process $Url | Out-Null }
-    return
   }
 
   # Size and place from the primary screen work area. A fixed size larger than
@@ -1398,7 +1417,9 @@ function Invoke-Launcher {
     return
   }
   $script:TrayState = $state
-  Write-Note "application window via $(Split-Path -Leaf $browserExe): ${width}x${height} at ($left,$top)"
+  if ($null -ne $browserExe) {
+    Write-Note "application window via $(Split-Path -Leaf $browserExe): ${width}x${height} at ($left,$top)"
+  }
   if (-not $NoTray) {
     $slot = Enter-DshTraySlot -InstallDir $AppDir
     $owned = $false
